@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Анализатор тендерной документации</title>
+<style>
+:root {
+  --primary: #208C8D;
+  --primary-dark: #1B7577;
+  --primary-light: rgba(32,140,141,0.08);
+  --bg: #FCFCF9;
+  --surface: #FFFFFF;
+  --text: #134252;
+  --text-secondary: #626C7C;
+  --border: #E0E0E0;
+  --error: #C0152F;
+  --radius: 8px;
+  --shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; padding: 24px; }
+.container { max-width: 1000px; margin: 0 auto; }
+header { margin-bottom: 28px; text-align: center; }
+h1 { font-size: 26px; font-weight: 600; margin-bottom: 6px; }
+.subtitle { color: var(--text-secondary); font-size: 14px; }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 24px; margin-bottom: 16px; box-shadow: var(--shadow); }
+
+/* DROPZONE */
+.dropzone { border: 2px dashed var(--primary); border-radius: var(--radius); padding: 36px 20px; text-align: center; cursor: pointer; transition: background 0.2s; background: var(--primary-light); }
+.dropzone:hover, .dropzone.dragover { background: rgba(32,140,141,0.14); }
+.dropzone input { display: none; }
+.dz-icon { font-size: 36px; margin-bottom: 10px; }
+.dz-text { color: var(--primary); font-weight: 500; font-size: 15px; }
+.dz-hint { color: var(--text-secondary); font-size: 12px; margin-top: 4px; }
+
+/* FILE PILLS */
+.file-list { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+.file-pill { display: flex; align-items: center; gap: 8px; padding: 5px 10px 5px 12px; border-radius: 20px; font-size: 13px; border: 1px solid var(--border); background: var(--bg); animation: popIn 0.2s ease-out; }
+@keyframes popIn { from { opacity:0; transform:scale(0.85); } to { opacity:1; transform:scale(1); } }
+.pill-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pill-badge { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
+.b-КОНТРАКТ   { background:#e0f4f4; color:#1B7577; }
+.b-ТЗ         { background:#e8f0fb; color:#1a56b0; }
+.b-ИЗВЕЩЕНИЕ  { background:#edf6e8; color:#2e7d32; }
+.b-ТРЕБОВАНИЯ { background:#fff3e0; color:#b35900; }
+.b-ПРОЧЕЕ     { background:#f2f2f0; color:#5f5e5a; }
+.b-МУСОР      { background:#fce8e8; color:#b71c1c; }
+.b-processing { background:#f2f2f0; color:#aaa; }
+.pill-rm { width:18px; height:18px; display:flex; align-items:center; justify-content:center; border-radius:50%; cursor:pointer; color:var(--text-secondary); background:transparent; border:none; font-size:14px; transition:background 0.15s; }
+.pill-rm:hover { background:#eee; color:var(--error); }
+
+/* PROMPT */
+details summary { cursor:pointer; font-weight:500; font-size:14px; color:var(--text); display:flex; align-items:center; gap:8px; user-select:none; list-style:none; }
+details summary::-webkit-details-marker { display:none; }
+details summary::before { content:'▶'; font-size:10px; color:var(--primary); transition:transform 0.2s; display:inline-block; }
+details[open] summary::before { transform:rotate(90deg); }
+.prompt-hint { font-size:12px; color:var(--text-secondary); margin:10px 0 8px; }
+.prompt-hint code { background:#fff3e0; color:#b35900; padding:1px 6px; border-radius:4px; }
+#promptEditor { width:100%; min-height:240px; padding:12px; border:1px solid var(--border); border-radius:var(--radius); font-family:monospace; font-size:12.5px; resize:vertical; color:var(--text); background:var(--bg); line-height:1.55; }
+#promptEditor:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(32,140,141,0.1); }
+
+/* METER */
+.meter-wrap { display:none; margin-bottom:16px; }
+.meter-label { font-size:12px; color:var(--text-secondary); display:flex; justify-content:space-between; margin-bottom:5px; }
+.meter-bar { height:4px; background:var(--border); border-radius:4px; overflow:hidden; }
+.meter-fill { height:100%; background:var(--primary); border-radius:4px; transition:width 0.4s, background 0.4s; }
+.meter-fill.warn { background:#e6a817; }
+.meter-fill.danger { background:var(--error); }
+.truncate-note { margin-top:8px; padding:8px 12px; border-radius:var(--radius); background:#fff8e1; border-left:3px solid #e6a817; font-size:13px; color:#7a5c00; display:none; }
+
+/* BUTTONS */
+.btn-row { display:flex; gap:12px; }
+button { padding:10px 22px; border:none; border-radius:var(--radius); font-weight:500; cursor:pointer; transition:all 0.2s; font-size:14px; }
+.btn-primary { background:var(--primary); color:white; }
+.btn-primary:hover { background:var(--primary-dark); }
+.btn-primary:disabled { background:#ccc; cursor:not-allowed; }
+.btn-secondary { background:var(--bg); border:1px solid var(--border); color:var(--text); }
+.btn-secondary:hover { background:#f5f5f5; }
+.btn-sm { padding:6px 14px; font-size:12px; }
+
+/* PROGRESS */
+.progress-wrap { display:none; margin-top:16px; }
+.steps { display:flex; flex-direction:column; gap:3px; }
+.step { font-size:13px; color:var(--text-secondary); padding:3px 0; display:flex; align-items:center; gap:8px; }
+.step.active { color:var(--primary); font-weight:500; }
+.step.done { color:#208C8D; }
+.step.done::before { content:'✓'; font-size:12px; }
+.step.active::before { content:''; width:10px; height:10px; border:2px solid var(--primary); border-top-color:transparent; border-radius:50%; animation:spin 0.7s linear infinite; display:inline-block; }
+.step.pending::before { content:'○'; font-size:12px; color:var(--border); }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* ERROR */
+.error-box { display:none; padding:12px; border-radius:var(--radius); background:rgba(192,21,47,0.06); border-left:3px solid var(--error); color:var(--error); font-size:14px; margin-bottom:12px; }
+
+/* RESULTS */
+.results-hdr { display:none; align-items:center; justify-content:space-between; margin-bottom:14px; }
+.results-hdr-title { font-size:18px; font-weight:600; }
+.results-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
+.save-group { display:flex; gap:8px; }
+
+.result-card { background:var(--surface); border-left:4px solid var(--primary); border-radius:var(--radius); padding:20px; margin-bottom:12px; box-shadow:var(--shadow); animation:fadeIn 0.4s ease-out; }
+@keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+.result-title { font-weight:600; font-size:14px; text-transform:uppercase; letter-spacing:0.4px; margin-bottom:10px; }
+.result-answer { font-size:14.5px; line-height:1.6; }
+.result-notfound { font-size:14px; color:var(--text-secondary); font-style:italic; }
+.citation { background:var(--primary-light); border-left:3px solid var(--primary); padding:10px 12px; margin-top:12px; border-radius:4px; font-size:12.5px; font-style:italic; color:var(--text-secondary); font-family:monospace; line-height:1.5; }
+.citation::before { content:'📌 '; }
+
+.skipped-list { margin-top:12px; padding:10px 14px; border-radius:var(--radius); background:#fff8e1; border-left:3px solid #e6a817; font-size:13px; color:#7a5c00; }
+.skipped-list ul { margin-top:4px; padding-left:16px; }
+
+footer { text-align:center; margin-top:40px; padding-top:20px; border-top:1px solid var(--border); font-size:13px; color:var(--text-secondary); }
+footer a { color:var(--primary); text-decoration:none; }
+
+@media print {
+  .card:not(.results-card), .dropzone, .btn-row, .progress-wrap, .meter-wrap, details, .error-box, footer, .save-group { display:none !important; }
+  .results-hdr { display:flex !important; }
+  .result-card { box-shadow:none; border:1px solid #ddd; page-break-inside:avoid; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>Анализатор тендерной документации</h1>
+  <p class="subtitle">Загрузите пакет документов — получите структурированный отчёт</p>
+</header>
+
+<!-- ЗАГРУЗКА -->
+<div class="card">
+  <div class="dropzone" id="dropzone">
+    <input type="file" id="fileInput" multiple accept=".pdf,.docx,.html,.htm,.txt,.zip">
+    <div class="dz-icon">📂</div>
+    <div class="dz-text">Перетащите файлы или нажмите для выбора</div>
+    <div class="dz-hint">PDF, DOCX, HTML, TXT, ZIP (в т.ч. вложенные) — можно несколько сразу</div>
+  </div>
+  <div class="file-list" id="fileList"></div>
+</div>
+
+<!-- ПРОМПТ -->
+<div class="card">
+  <details id="promptDetails">
+    <summary>Вопросы к документу (промпт)</summary>
+    <p class="prompt-hint">Редактируйте вопросы под ваш тендер. Не удаляйте метку <code>{{CONTRACT_TEXT}}</code>.</p>
+    <textarea id="promptEditor" spellcheck="false"></textarea>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+      <button class="btn-secondary btn-sm" id="resetPromptBtn">↺ Сбросить</button>
+    </div>
+  </details>
+</div>
+
+<!-- УПРАВЛЕНИЕ -->
+<div class="card">
+  <div class="meter-wrap" id="meterWrap">
+    <div class="meter-label"><span>Контекст для модели</span><span id="meterText">—</span></div>
+    <div class="meter-bar"><div class="meter-fill" id="meterFill" style="width:0%"></div></div>
+    <div class="truncate-note" id="truncateNote">⚠️ Документация объёмнее лимита — в модель переданы наиболее релевантные разделы.</div>
+  </div>
+
+  <div class="error-box" id="errorBox"></div>
+
+  <div class="btn-row">
+    <button class="btn-primary" id="analyzeBtn" disabled>Анализировать</button>
+    <button class="btn-secondary" id="clearBtn">Очистить</button>
+  </div>
+
+  <div class="progress-wrap" id="progressWrap">
+    <div class="steps">
+      <div class="step pending" id="s1">Распаковка и инвентаризация файлов</div>
+      <div class="step pending" id="s2">Извлечение текста (Docling)</div>
+      <div class="step pending" id="s3">Классификация и нарезка на разделы</div>
+      <div class="step pending" id="s4">Маршрутизация и сборка контекста</div>
+      <div class="step pending" id="s5">Запрос к DeepSeek</div>
+      <div class="step pending" id="s6">Формирование отчёта</div>
+    </div>
+  </div>
+</div>
+
+<!-- РЕЗУЛЬТАТЫ -->
+<div class="results-hdr" id="resultsHdr">
+  <div>
+    <div class="results-hdr-title">Результаты анализа</div>
+    <div class="results-meta" id="resultsMeta"></div>
+  </div>
+  <div class="save-group">
+    <button class="btn-secondary btn-sm" id="saveTxtBtn">⬇ TXT</button>
+    <button class="btn-secondary btn-sm" onclick="window.print()">🖨 PDF / Печать</button>
+  </div>
+</div>
+<div id="resultsContainer"></div>
+
+</div><!-- /container -->
+
+<footer>
+  Разработано в лаборатории
+  <a href="https://t.me/tickettotender" target="_blank" rel="noopener noreferrer">тендеры ex machina</a>
+</footer>
+
+<script>
+// ── Состояние ─────────────────────────────────────────────
+let uploadedFiles = [];
+let lastResults = null;
+let lastMeta = null;
+let defaultPrompt = '';
+
+// ── Загружаем промпт с сервера ─────────────────────────────
+(async () => {
+  try {
+    const r = await fetch('/prompt');
+    const d = await r.json();
+    defaultPrompt = d.prompt;
+    document.getElementById('promptEditor').value = defaultPrompt;
+  } catch(e) {
+    console.warn('Не удалось загрузить промпт:', e);
+  }
+})();
+
+document.getElementById('resetPromptBtn').addEventListener('click', () => {
+  document.getElementById('promptEditor').value = defaultPrompt;
+});
+
+// ── Dropzone ──────────────────────────────────────────────
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dragover'); addFiles([...e.dataTransfer.files]); });
+fileInput.addEventListener('change', e => { addFiles([...e.target.files]); fileInput.value = ''; });
+
+function addFiles(files) {
+  for (const f of files) {
+    if (!uploadedFiles.find(u => u.name === f.name && u.size === f.size)) {
+      uploadedFiles.push(f);
+    }
+  }
+  renderPills();
+  document.getElementById('analyzeBtn').disabled = uploadedFiles.length === 0;
+}
+
+function removeFile(i) {
+  uploadedFiles.splice(i, 1);
+  renderPills();
+  document.getElementById('analyzeBtn').disabled = uploadedFiles.length === 0;
+}
+
+function renderPills() {
+  const list = document.getElementById('fileList');
+  list.innerHTML = '';
+  uploadedFiles.forEach((f, i) => {
+    const pill = document.createElement('div');
+    pill.className = 'file-pill';
+    pill.innerHTML = `
+      <span class="pill-name" title="${esc(f.name)}">${esc(f.name)}</span>
+      <span class="pill-badge b-processing" id="badge-${i}">...</span>
+      <button class="pill-rm" title="Удалить">×</button>`;
+    pill.querySelector('.pill-rm').addEventListener('click', () => removeFile(i));
+    list.appendChild(pill);
+  });
+}
+
+function setBadge(name, type) {
+  // Ищем пилл по имени файла
+  const pills = document.querySelectorAll('.file-pill');
+  pills.forEach(pill => {
+    const nameEl = pill.querySelector('.pill-name');
+    if (nameEl && nameEl.title === name) {
+      const badge = pill.querySelector('.pill-badge');
+      badge.className = `pill-badge b-${type}`;
+      badge.textContent = type;
+    }
+  });
+}
+
+// ── Прогресс ─────────────────────────────────────────────
+function setStep(id, state) {
+  const el = document.getElementById(id);
+  if (el) el.className = 'step ' + state;
+}
+function allSteps(state) {
+  ['s1','s2','s3','s4','s5','s6'].forEach(s => setStep(s, state));
+}
+
+// ── Метр контекста ────────────────────────────────────────
+function updateMeter(chars, truncated) {
+  const MAX = 100000;
+  const mw = document.getElementById('meterWrap');
+  mw.style.display = 'block';
+  const pct = Math.min(100, Math.round(chars / MAX * 100));
+  const fill = document.getElementById('meterFill');
+  fill.style.width = pct + '%';
+  fill.className = 'meter-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warn' : '');
+  const tokens = Math.round(chars / 4).toLocaleString('ru');
+  document.getElementById('meterText').textContent = `${chars.toLocaleString('ru')} симв. · ~${tokens} токенов (${pct}%)`;
+  document.getElementById('truncateNote').style.display = truncated ? 'block' : 'none';
+}
+
+// ── Анализ ────────────────────────────────────────────────
+document.getElementById('analyzeBtn').addEventListener('click', runAnalysis);
+document.getElementById('clearBtn').addEventListener('click', clearAll);
+
+async function runAnalysis() {
+  if (!uploadedFiles.length) return;
+
+  const analyzeBtn = document.getElementById('analyzeBtn');
+  analyzeBtn.disabled = true;
+  analyzeBtn.textContent = 'Анализирую...';
+
+  document.getElementById('errorBox').style.display = 'none';
+  document.getElementById('resultsContainer').innerHTML = '';
+  document.getElementById('resultsHdr').style.display = 'none';
+  document.getElementById('progressWrap').style.display = 'block';
+  allSteps('pending');
+
+  // Шаги 1-4 визуально идут параллельно с серверной обработкой
+  setStep('s1', 'active');
+
+  try {
+    const formData = new FormData();
+    uploadedFiles.forEach(f => formData.append('files', f));
+    formData.append('prompt', document.getElementById('promptEditor').value);
+
+    // Имитируем прогресс пока сервер думает
+    const stepTimer = simulateSteps();
+
+    const response = await fetch('/analyze', { method: 'POST', body: formData });
+    clearInterval(stepTimer);
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({ detail: response.statusText }));
+      throw new Error(err.detail || `Ошибка сервера ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    // Обновляем бейджи файлов
+    if (data.meta?.files) {
+      data.meta.files.forEach(f => setBadge(f.name, f.type));
+    }
+
+    updateMeter(data.meta?.context_chars || 0, data.meta?.truncated || false);
+
+    setStep('s5', 'done');
+    setStep('s6', 'active');
+
+    lastResults = data.results;
+    lastMeta = data.meta;
+    renderResults(data.results, data.meta);
+    setStep('s6', 'done');
+
+  } catch(e) {
+    allSteps('pending');
+    showError(e.message);
+    console.error(e);
+  } finally {
+    analyzeBtn.disabled = false;
+    analyzeBtn.textContent = 'Анализировать';
+  }
+}
+
+function simulateSteps() {
+  const schedule = [
+    [0,    's1', 'active'],
+    [800,  's1', 'done'],  ['s2', 'active'],
+    [3000, 's2', 'done'],  ['s3', 'active'],
+    [5000, 's3', 'done'],  ['s4', 'active'],
+    [6500, 's4', 'done'],  ['s5', 'active'],
+  ];
+  let i = 0;
+  return setInterval(() => {
+    if (i >= schedule.length) return;
+    const entry = schedule[i++];
+    if (typeof entry[0] === 'number') {
+      // ждём — сделано через setInterval с накоплением, упрощаем:
+    }
+    if (typeof entry[0] === 'string') setStep(entry[0], entry[1]);
+    else setStep(entry[1], entry[2]);
+  }, 1200);
+}
+
+function clearAll() {
+  uploadedFiles = [];
+  document.getElementById('fileList').innerHTML = '';
+  document.getElementById('resultsContainer').innerHTML = '';
+  document.getElementById('resultsHdr').style.display = 'none';
+  document.getElementById('meterWrap').style.display = 'none';
+  document.getElementById('progressWrap').style.display = 'none';
+  document.getElementById('errorBox').style.display = 'none';
+  document.getElementById('analyzeBtn').disabled = true;
+  lastResults = null; lastMeta = null;
+}
+
+function showError(msg) {
+  const box = document.getElementById('errorBox');
+  box.textContent = '⚠️ ' + msg;
+  box.style.display = 'block';
+}
+
+// ── Рендер результатов ────────────────────────────────────
+function renderResults(items, meta) {
+  const container = document.getElementById('resultsContainer');
+  container.innerHTML = '';
+
+  // Пропущенные файлы
+  if (meta?.skipped?.length) {
+    const skippedDiv = document.createElement('div');
+    skippedDiv.className = 'skipped-list';
+    skippedDiv.innerHTML = `<strong>Пропущены файлы:</strong><ul>${
+      meta.skipped.map(s => `<li><b>${esc(s.name)}</b> — ${esc(s.reason)}</li>`).join('')
+    }</ul>`;
+    container.appendChild(skippedDiv);
+  }
+
+  if (!items?.length) {
+    container.innerHTML += '<div style="color:var(--text-secondary);padding:20px 0">Нет результатов</div>';
+    return;
+  }
+
+  const now = new Date().toLocaleString('ru', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  const fileLabels = meta?.files?.map(f => `${f.name} (${f.type})`).join(', ') || '';
+  document.getElementById('resultsMeta').textContent = `${now}  ·  ${fileLabels}`;
+  document.getElementById('resultsHdr').style.display = 'flex';
+
+  items.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'result-card';
+    const notFound = !item.answer || item.answer.toLowerCase().includes('не найден');
+    let html = `<div class="result-title">${esc(item.title || '—')}</div>`;
+    if (notFound) {
+      html += `<div class="result-notfound">Информация не найдена в документации</div>`;
+    } else {
+      html += `<div class="result-answer">${esc(item.answer || '')}</div>`;
+    }
+    if (item.citation && item.citation.trim().length > 5 && !item.citation.toLowerCase().includes('не найден')) {
+      html += `<div class="citation">${esc(item.citation)}</div>`;
+    }
+    card.innerHTML = html;
+    container.appendChild(card);
+  });
+}
+
+// ── Сохранение TXT ────────────────────────────────────────
+document.getElementById('saveTxtBtn').addEventListener('click', () => {
+  if (!lastResults) return;
+  const now = new Date().toLocaleString('ru');
+  const files = lastMeta?.files?.map(f => f.name).join(', ') || '';
+  let txt = `АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ\nДата: ${now}\nФайлы: ${files}\n${'='.repeat(60)}\n\n`;
+  lastResults.forEach((item, i) => {
+    txt += `${i+1}. ${(item.title||'').toUpperCase()}\n${'─'.repeat(40)}\n`;
+    txt += `Ответ: ${item.answer || 'Информация не найдена'}\n`;
+    if (item.citation?.trim().length > 5) txt += `Цитата: ${item.citation}\n`;
+    txt += '\n';
+  });
+  const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `tender-report-${new Date().toISOString().slice(0,10)}.txt`;
+  a.click();
+});
+
+// ── Helpers ───────────────────────────────────────────────
+function esc(s) {
+  if (!s) return '';
+  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+</script>
+</body>
+</html>

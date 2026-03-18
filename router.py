@@ -1,0 +1,116 @@
+"""
+pipeline/router.py
+
+Шаг 4 — Маршрутизация вопросов + сборка контекста.
+
+Каждый вопрос из промпта привязан к типам документов и ключевым словам.
+Разделы ранжируются по релевантности, затем набираются до лимита токенов.
+"""
+
+from dataclasses import dataclass
+from pipeline.classifier import TYPE_PRIORITY
+from pipeline.splitter import Section
+
+
+# Ключевые слова по теме вопросов (стемы, без окончаний)
+SECTION_KEYWORDS: list[str] = [
+    # Срок поставки
+    "срок", "поставк", "исполнен", "дней", "календарн", "рабочих дн",
+    # Место поставки
+    "место поставк", "адрес", "получател", "склад", "доставк",
+    # Обеспечение
+    "обеспечен", "банковск", "гарантия", "залог",
+    # Монтаж
+    "монтаж", "установк", "пусконаладк", "запуск", "сборк", "шефмонтаж",
+    # Документы при поставке
+    "сертификат", "паспорт", "удостоверен", "свидетельств", "поверк",
+    "регистрационн", "накладн", "счёт-фактур", "товарн",
+    # Штрафы
+    "штраф", "пен ", "неустойк", "санкц", "ответственност",
+    # Оплата
+    "оплат", "расчёт", "расчет", "платёж", "платеж", "финансиров",
+]
+
+
+@dataclass
+class RankedSection:
+    doc_name: str
+    doc_type: str
+    section: Section
+    score: float
+
+
+def _score_section(section: Section, doc_type: str) -> float:
+    """
+    Оценивает релевантность раздела.
+    Учитывает: ключевые слова + приоритет типа документа.
+    """
+    text_lower = section.text.lower()
+    keyword_hits = sum(1 for kw in SECTION_KEYWORDS if kw in text_lower)
+
+    # Штраф за мусорный тип
+    type_penalty = TYPE_PRIORITY.get(doc_type, 5)
+
+    # Базовый score: ключевые слова минус штраф за неважный тип
+    return keyword_hits - (type_penalty * 0.3)
+
+
+def build_context(
+    docs: list[dict],  # [{"name": str, "type": str, "sections": list[Section]}]
+    max_chars: int = 100_000,
+) -> tuple[str, bool, int]:
+    """
+    Собирает финальный контекст для промпта.
+
+    Returns:
+        context (str): текст для подстановки в промпт
+        truncated (bool): был ли контекст урезан
+        char_count (int): итоговое количество символов
+    """
+    # Исключаем мусор
+    useful_docs = [d for d in docs if d["type"] != "МУСОР"]
+    if not useful_docs:
+        useful_docs = docs  # если всё мусор — берём всё
+
+    # Ранжируем все разделы
+    ranked: list[RankedSection] = []
+    for doc in useful_docs:
+        for section in doc["sections"]:
+            score = _score_section(section, doc["type"])
+            ranked.append(RankedSection(
+                doc_name=doc["name"],
+                doc_type=doc["type"],
+                section=section,
+                score=score,
+            ))
+
+    # Сначала по убыванию score, потом документы с более высоким приоритетом типа
+    ranked.sort(key=lambda r: (-r.score, TYPE_PRIORITY.get(r.doc_type, 5)))
+
+    context_parts: list[str] = []
+    total_chars = 0
+    truncated = False
+
+    for ranked_sec in ranked:
+        block = (
+            f"\n\n--- [{ranked_sec.doc_name} | {ranked_sec.doc_type}] "
+            f"Раздел: {ranked_sec.section.heading} ---\n"
+            f"{ranked_sec.section.text}"
+        )
+
+        if total_chars + len(block) > max_chars:
+            # Если раздел очень релевантный — вставляем его обрезанным
+            if ranked_sec.score >= 3:
+                remaining = max_chars - total_chars - 120
+                if remaining > 300:
+                    block = block[:remaining] + "\n...[обрезано]"
+                    context_parts.append(block)
+                    total_chars += len(block)
+            truncated = True
+            break
+
+        context_parts.append(block)
+        total_chars += len(block)
+
+    context = "".join(context_parts).strip()
+    return context, truncated, total_chars

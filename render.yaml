@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tender-analyzer
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+
+    # Переменные окружения — значения вводятся в дашборде Render,
+    # здесь только имена (без значений, чтобы не попасть в git)
+    envVars:
+      - key: API_KEY
+        sync: false          # Render попросит ввести вручную в UI
+      - key: API_URL
+        value: https://litellm.tokengate.ru/v1/chat/completions
+      - key: MODEL
+        value: deepseek/deepseek-chat
+      - key: MAX_TOKENS
+        value: "2000"
+      - key: MAX_CONTEXT_CHARS
+        value: "100000"
+
+    # Healthcheck — Render проверяет, что сервис живой
+    healthCheckPath: /

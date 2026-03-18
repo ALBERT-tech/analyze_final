@@ -1,0 +1,40 @@
+# Секреты — никогда в git
+.env
+*.env
+config_local.py
+secrets.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+
+# Docling: модели скачиваются автоматически, не коммитим
+.docling/
+docling_models/
+
+# Временные файлы загрузок
+tmp/
+uploads/
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.DS_Store
+.DS_Store
+
+# Логи
+*.log
+logs/
+
+# Railway / Render
+.railway/
