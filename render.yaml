@@ -19,5 +19,5 @@ services:
       - key: MAX_CONTEXT_CHARS
         value: "100000"
 
-    # Healthcheck — Render проверяет, что сервис живой
-    healthCheckPath: /
+    # Healthcheck — возвращает JSON {"status":"ok"}, не HTML
+    healthCheckPath: /health
