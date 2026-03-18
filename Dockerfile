@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Код приложения
 COPY . .
 
+# Проверяем что pipeline пакет на месте
+RUN python -c "from pipeline.classifier import classify; print('pipeline OK')"
+
 # Docling скачивает модели при первом запуске.
 # Делаем это на этапе сборки образа, чтобы не ждать при старте контейнера.
 RUN python -c "from docling.document_converter import DocumentConverter; DocumentConverter()" || true
