@@ -68,6 +68,12 @@ async def index():
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 
+@app.head("/")
+async def index_head():
+    """Render использует HEAD для health check — отвечаем 200."""
+    return HTMLResponse(content="", status_code=200)
+
+
 @app.get("/prompt")
 async def get_default_prompt():
     return {"prompt": load_default_prompt()}
