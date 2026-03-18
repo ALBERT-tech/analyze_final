@@ -60,6 +60,12 @@ def load_default_prompt() -> str:
 
 # ── Эндпоинты ────────────────────────────────────────────────
 
+@app.get("/health")
+async def health():
+    """Health check — возвращает JSON, не HTML."""
+    return {"status": "ok"}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path("static/index.html")
@@ -70,7 +76,7 @@ async def index():
 
 @app.head("/")
 async def index_head():
-    """Render использует HEAD для health check — отвечаем 200."""
+    """Render health check — HEAD на / отвечаем 200."""
     return HTMLResponse(content="", status_code=200)
 
 
