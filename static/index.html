@@ -207,21 +207,10 @@ let lastMeta = null;
 let defaultPrompt = '';
 
 // ── Загружаем промпт с сервера ─────────────────────────────
-(async () => {
-  try {
-    const r = await fetch('/prompt');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json();
-    defaultPrompt = d.prompt || '';
-    document.getElementById('promptEditor').value = defaultPrompt;
-    console.log('[PROMPT] Промпт загружен:', defaultPrompt.length, 'симв.');
-  } catch(e) {
-    console.warn('[PROMPT] Не удалось загрузить промпт:', e);
-    document.getElementById('promptDetails').open = true;
-    document.getElementById('promptEditor').placeholder =
-      'Не удалось загрузить промпт с сервера. Вставьте текст вручную. Не забудьте метку {{CONTRACT_TEXT}}';
-  }
-})();
+// Промпт встраивается сервером при отдаче страницы
+defaultPrompt = `__DEFAULT_PROMPT__`;
+document.getElementById('promptEditor').value = defaultPrompt;
+console.log('[PROMPT] Промпт загружен:', defaultPrompt.length, 'симв.');
 
 document.getElementById('resetPromptBtn').addEventListener('click', () => {
   document.getElementById('promptEditor').value = defaultPrompt;
