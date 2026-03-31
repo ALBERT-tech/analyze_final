@@ -43,7 +43,7 @@ API_KEY           = os.getenv("API_KEY", "")
 API_URL           = os.getenv("API_URL", "https://litellm.tokengate.ru/v1/chat/completions")
 MODEL             = os.getenv("MODEL", "deepseek/deepseek-chat")
 MAX_TOKENS        = int(os.getenv("MAX_TOKENS", "2000"))
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "100000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "80000"))
 
 DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
 
@@ -156,7 +156,15 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
         if response.status_code != 200:
             err_body = response.text[:500]
             logger.error(f"[TASK {task_id[:8]}] API ошибка {response.status_code}: {err_body}")
-            task.update(status="error", detail=f"Ошибка API модели: {err_body[:200]}")
+            # Понятное сообщение при превышении контекста
+            if "max_n" in err_body or "context" in err_body.lower() or "token" in err_body.lower():
+                task.update(status="error", detail=(
+                    "Документация слишком большая для модели. "
+                    "Попробуйте загрузить меньше файлов или только ключевые документы "
+                    "(контракт + ТЗ), без вспомогательных."
+                ))
+            else:
+                task.update(status="error", detail=f"Ошибка API модели: {err_body[:200]}")
             return
 
         data = response.json()
