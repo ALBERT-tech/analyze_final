@@ -157,21 +157,25 @@ def _extract_xls(file_path: Path) -> str:
 
 
 def _extract_doc_antiword(file_path: Path) -> str:
-    """DOC (OLE2) -> текст через antiword."""
+    """DOC (OLE2) -> текст через antiword. Фолбэк: если .doc — на самом деле HTML."""
     logger.info(f"[DOC] antiword -> {file_path.name}")
-    result = subprocess.run(
-        ["antiword", str(file_path)],
-        capture_output=True, text=True, timeout=30,
-        encoding="utf-8", errors="replace",
-    )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise RuntimeError(stderr or "antiword вернул ненулевой код")
-    text = result.stdout.strip()
-    if not text:
-        raise RuntimeError("antiword вернул пустой текст")
-    logger.info(f"[DOC] {len(text)} симв. из {file_path.name}")
-    return text
+    try:
+        result = subprocess.run(
+            ["antiword", str(file_path)],
+            capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "antiword вернул ненулевой код")
+        text = result.stdout.strip()
+        if not text:
+            raise RuntimeError("antiword вернул пустой текст")
+        logger.info(f"[DOC] {len(text)} симв. из {file_path.name}")
+        return text
+    except (RuntimeError, FileNotFoundError) as e:
+        logger.warning(f"[DOC] antiword не смог: {e}. Пробую как HTML...")
+        # Фолбэк: ЕИС часто отдаёт HTML-файлы с расширением .doc
+        return _extract_html(file_path)
 
 
 # Маппинг расширения -> обработчик

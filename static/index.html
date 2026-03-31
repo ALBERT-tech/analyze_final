@@ -326,6 +326,9 @@ async function runAnalysis() {
 
     if (!response.ok) {
       const err = await response.json().catch(() => ({ detail: response.statusText }));
+      if (response.status === 502) {
+        throw new Error('Сервер не успел обработать запрос (таймаут). Попробуйте загрузить меньше файлов или повторите через минуту.');
+      }
       throw new Error(err.detail || `Ошибка сервера ${response.status}`);
     }
 
