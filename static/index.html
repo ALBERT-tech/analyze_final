@@ -370,14 +370,21 @@ async function runAnalysis() {
 
 function pollStatus(taskId) {
   return new Promise((resolve, reject) => {
+    let failures = 0;
+    const MAX_FAILURES = 10; // 10 подряд = ~30 сек без связи
     const interval = setInterval(async () => {
       try {
         const r = await fetch('/status/' + taskId);
         if (!r.ok) {
-          clearInterval(interval);
-          reject(new Error('Ошибка при проверке статуса'));
+          failures++;
+          console.warn('[POLL] HTTP', r.status, '(попытка', failures + '/' + MAX_FAILURES + ')');
+          if (failures >= MAX_FAILURES) {
+            clearInterval(interval);
+            reject(new Error('Сервер не отвечает. Проверьте соединение и попробуйте снова.'));
+          }
           return;
         }
+        failures = 0; // сброс при успешном ответе
         const d = await r.json();
         console.log('[POLL]', d.status, d.step || '', d.detail || '');
 
@@ -391,8 +398,12 @@ function pollStatus(taskId) {
           reject(new Error(d.detail || 'Ошибка обработки'));
         }
       } catch(e) {
-        clearInterval(interval);
-        reject(e);
+        failures++;
+        console.warn('[POLL] Сбой сети (попытка', failures + '/' + MAX_FAILURES + '):', e.message);
+        if (failures >= MAX_FAILURES) {
+          clearInterval(interval);
+          reject(new Error('Потеряна связь с сервером. Проверьте соединение и попробуйте снова.'));
+        }
       }
     }, 3000);
   });
