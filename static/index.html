@@ -297,6 +297,24 @@ function updateMeter(chars, truncated) {
 document.getElementById('analyzeBtn').addEventListener('click', runAnalysis);
 document.getElementById('clearBtn').addEventListener('click', clearAll);
 
+// Маппинг шагов сервера на элементы UI
+const STEP_MAP = {
+  uploading:   { active: 's1', done: [] },
+  extracting:  { active: 's2', done: ['s1'] },
+  classifying: { active: 's3', done: ['s1','s2'] },
+  context:     { active: 's4', done: ['s1','s2','s3'] },
+  api:         { active: 's5', done: ['s1','s2','s3','s4'] },
+  parsing:     { active: 's6', done: ['s1','s2','s3','s4','s5'] },
+};
+
+function applyStep(step) {
+  const mapping = STEP_MAP[step];
+  if (!mapping) return;
+  allSteps('pending');
+  mapping.done.forEach(s => setStep(s, 'done'));
+  setStep(mapping.active, 'active');
+}
+
 async function runAnalysis() {
   if (!uploadedFiles.length) return;
 
@@ -309,45 +327,36 @@ async function runAnalysis() {
   document.getElementById('resultsHdr').style.display = 'none';
   document.getElementById('progressWrap').style.display = 'block';
   allSteps('pending');
-
-  // Шаги 1-4 визуально идут параллельно с серверной обработкой
   setStep('s1', 'active');
 
   try {
+    // 1. Отправляем файлы — получаем task_id
     const formData = new FormData();
     uploadedFiles.forEach(f => formData.append('files', f));
     formData.append('prompt', document.getElementById('promptEditor').value);
 
-    // Имитируем прогресс пока сервер думает
-    const stepTimer = simulateSteps();
-
-    const response = await fetch('/analyze', { method: 'POST', body: formData });
-    clearInterval(stepTimer);
-
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({ detail: response.statusText }));
-      if (response.status === 502) {
-        throw new Error('Сервер не успел обработать запрос (таймаут). Попробуйте загрузить меньше файлов или повторите через минуту.');
-      }
-      throw new Error(err.detail || `Ошибка сервера ${response.status}`);
+    const submitResp = await fetch('/analyze', { method: 'POST', body: formData });
+    if (!submitResp.ok) {
+      const err = await submitResp.json().catch(() => ({ detail: submitResp.statusText }));
+      throw new Error(err.detail || 'Ошибка отправки файлов');
     }
+    const { task_id } = await submitResp.json();
+    console.log('[POLL] Задача создана:', task_id);
 
-    const data = await response.json();
+    // 2. Поллим статус каждые 3 сек
+    const data = await pollStatus(task_id);
 
-    // Обновляем бейджи файлов
+    // 3. Рендерим результат
     if (data.meta?.files) {
       data.meta.files.forEach(f => setBadge(f.name, f.type));
     }
-
     updateMeter(data.meta?.context_chars || 0, data.meta?.truncated || false);
-
-    setStep('s5', 'done');
-    setStep('s6', 'active');
+    allSteps('pending');
+    ['s1','s2','s3','s4','s5','s6'].forEach(s => setStep(s, 'done'));
 
     lastResults = data.results;
     lastMeta = data.meta;
     renderResults(data.results, data.meta);
-    setStep('s6', 'done');
 
   } catch(e) {
     allSteps('pending');
@@ -359,24 +368,34 @@ async function runAnalysis() {
   }
 }
 
-function simulateSteps() {
-  const schedule = [
-    [0,    's1', 'active'],
-    [800,  's1', 'done'],  ['s2', 'active'],
-    [3000, 's2', 'done'],  ['s3', 'active'],
-    [5000, 's3', 'done'],  ['s4', 'active'],
-    [6500, 's4', 'done'],  ['s5', 'active'],
-  ];
-  let i = 0;
-  return setInterval(() => {
-    if (i >= schedule.length) return;
-    const entry = schedule[i++];
-    if (typeof entry[0] === 'number') {
-      // ждём — сделано через setInterval с накоплением, упрощаем:
-    }
-    if (typeof entry[0] === 'string') setStep(entry[0], entry[1]);
-    else setStep(entry[1], entry[2]);
-  }, 1200);
+function pollStatus(taskId) {
+  return new Promise((resolve, reject) => {
+    const interval = setInterval(async () => {
+      try {
+        const r = await fetch('/status/' + taskId);
+        if (!r.ok) {
+          clearInterval(interval);
+          reject(new Error('Ошибка при проверке статуса'));
+          return;
+        }
+        const d = await r.json();
+        console.log('[POLL]', d.status, d.step || '', d.detail || '');
+
+        if (d.status === 'processing') {
+          applyStep(d.step);
+        } else if (d.status === 'done') {
+          clearInterval(interval);
+          resolve(d);
+        } else if (d.status === 'error') {
+          clearInterval(interval);
+          reject(new Error(d.detail || 'Ошибка обработки'));
+        }
+      } catch(e) {
+        clearInterval(interval);
+        reject(e);
+      }
+    }, 3000);
+  });
 }
 
 function clearAll() {
