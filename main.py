@@ -44,7 +44,6 @@ DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
 
 # ── FastAPI ──────────────────────────────────────────────────
 app = FastAPI(title="Анализатор тендерной документации")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def load_default_prompt() -> str:
@@ -205,3 +204,7 @@ async def analyze(
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# Статика монтируется ПОСЛЕ роутов, чтобы /prompt и другие эндпоинты не перехватывались
+app.mount("/static", StaticFiles(directory="static"), name="static")
