@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-SKIP_EXTENSIONS = {".pptx", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
+SKIP_EXTENSIONS = {".pptx", ".xlsb", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
 
 MAX_ZIP_DEPTH = 3
 
@@ -42,6 +42,19 @@ class ExtractedFile:
 
 # -- ZIP ------------------------------------------------------------------
 
+def _fix_zip_filename(name: str) -> str:
+    """Исправляет кодировку имён файлов в ZIP (CP437 -> CP866 для кириллицы)."""
+    try:
+        # Если имя содержит нечитаемые символы — скорее всего CP437, пробуем CP866
+        if any(ord(c) > 127 for c in name):
+            fixed = name.encode("cp437").decode("cp866")
+            if any("\u0400" <= c <= "\u04FF" for c in fixed):  # Есть кириллица
+                return fixed
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+    return name
+
+
 def _unpack_zip(zip_path: Path, target_dir: Path, depth: int = 0) -> list[Path]:
     """Рекурсивно распаковывает ZIP, возвращает список путей к файлам."""
     if depth > MAX_ZIP_DEPTH:
@@ -51,7 +64,17 @@ def _unpack_zip(zip_path: Path, target_dir: Path, depth: int = 0) -> list[Path]:
     found = []
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(target_dir)
+            for info in zf.infolist():
+                # Исправляем кодировку имени
+                fixed_name = _fix_zip_filename(info.filename)
+                # Извлекаем файл
+                data = zf.read(info.filename)
+                dest = target_dir / fixed_name
+                if info.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(data)
         logger.info(f"[ZIP] Распакован: {zip_path.name}")
     except zipfile.BadZipFile:
         logger.warning(f"[ZIP] Битый архив: {zip_path}")
