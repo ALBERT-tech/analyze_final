@@ -192,38 +192,46 @@ async def call_deepseek(prompt_text: str, task_id: str, label: str) -> list | No
 
 # -- Мерж результатов ------------------------------------------------------
 
-def merge_results(api_results: dict[str, list | None]) -> tuple[list, list]:
+def merge_results(api_results: dict[str, list | None]) -> tuple[dict, list]:
     """
-    Объединяет результаты 4 запросов в единый список.
+    Объединяет результаты 4 запросов в два блока: risks и parameters.
     Добавляет поле source к каждому элементу.
 
     Returns:
-        (all_results, warnings)
+        ({"risks": [...], "parameters": [...]}, warnings)
     """
-    all_results = []
+    risks = []
+    parameters = []
     warnings = []
 
-    source_labels = {
-        "contract_risks":  "КОНТРАКТ (риски)",
-        "contract_params": "КОНТРАКТ (параметры)",
-        "notice":          "ИЗВЕЩЕНИЕ",
-        "techspec":        "ТЗ",
-    }
+    # Блок 1: Риски (из contract_risks)
+    cr = api_results.get("contract_risks")
+    if cr is None:
+        warnings.append("Не удалось проанализировать: КОНТРАКТ (риски)")
+    else:
+        for item in cr:
+            item["source"] = "КОНТРАКТ"
+            risks.append(item)
 
-    for key, label in source_labels.items():
+    # Блок 2: Параметры (из contract_params + notice + techspec)
+    for key, label in [
+        ("contract_params", "КОНТРАКТ"),
+        ("notice", "ИЗВЕЩЕНИЕ"),
+        ("techspec", "ТЗ"),
+    ]:
         items = api_results.get(key)
         if items is None:
             warnings.append(f"Не удалось проанализировать: {label}")
             continue
         for item in items:
             item["source"] = label
-            all_results.append(item)
+            parameters.append(item)
 
-    return all_results, warnings
+    return {"risks": risks, "parameters": parameters}, warnings
 
 
-def format_checklist_report(results: list, warnings: list, meta: dict) -> str:
-    """Форматирует результаты в текстовый отчёт с секциями по источникам."""
+def format_checklist_report(merged: dict, warnings: list, meta: dict) -> str:
+    """Форматирует результаты как в чек-листе: Блок 1 (Риски) → Блок 2 (Параметры)."""
     lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
 
     files = meta.get("files", [])
@@ -237,26 +245,48 @@ def format_checklist_report(results: list, warnings: list, meta: dict) -> str:
             lines.append(f"!!! {w}")
         lines.append("")
 
-    # Группируем по source
-    current_source = None
-    num = 0
-    for item in results:
-        source = item.get("source", "")
-        if source != current_source:
-            current_source = source
-            lines.append(f"=== {source} ===")
+    # Блок 1: Риски
+    risks = merged.get("risks", [])
+    if risks:
+        lines.append("=" * 40)
+        lines.append("БЛОК 1 — РИСКИ (стоп-сигналы)")
+        lines.append("=" * 40)
+        lines.append("")
+        for i, item in enumerate(risks, 1):
+            title = item.get("title", "")
+            answer = item.get("answer", "")
+            citation = item.get("citation", "")
+            lines.append(f"{i}. {title}")
+            lines.append(f"   {answer}")
+            if citation and citation.strip() not in ("", "---"):
+                lines.append(f"   [{citation}]")
             lines.append("")
 
-        num += 1
-        title = item.get("title", "")
-        answer = item.get("answer", "")
-        citation = item.get("citation", "")
-
-        lines.append(f"{num}. {title}")
-        lines.append(f"   {answer}")
-        if citation and citation != "---":
-            lines.append(f"   [{citation}]")
+    # Блок 2: Параметры
+    parameters = merged.get("parameters", [])
+    if parameters:
+        lines.append("=" * 40)
+        lines.append("БЛОК 2 — ИЗВЛЕКАЕМЫЕ ПАРАМЕТРЫ")
+        lines.append("=" * 40)
         lines.append("")
+        current_source = None
+        num = 0
+        for item in parameters:
+            source = item.get("source", "")
+            if source != current_source:
+                current_source = source
+                lines.append(f"--- {source} ---")
+                lines.append("")
+
+            num += 1
+            title = item.get("title", "")
+            answer = item.get("answer", "")
+            citation = item.get("citation", "")
+            lines.append(f"{num}. {title}")
+            lines.append(f"   {answer}")
+            if citation and citation.strip() not in ("", "---"):
+                lines.append(f"   [{citation}]")
+            lines.append("")
 
     return "\n".join(lines).strip()
 
@@ -377,13 +407,16 @@ async def process_task_parallel(task_id: str, saved_paths: list[Path], tmp_dir: 
         # -- Шаг 6: Мерж результатов --
         task.update(step="parsing", detail="Формирование отчёта...")
 
-        all_results, warnings = merge_results(api_results)
+        merged, warnings = merge_results(api_results)
 
-        if not all_results:
+        total = len(merged.get("risks", [])) + len(merged.get("parameters", []))
+        if total == 0:
             task.update(status="error", detail="Модель не вернула ни одного ответа. Попробуйте ещё раз.")
             return
 
-        logger.info(f"[TASK {task_id[:8]}] Итого: {len(all_results)} ответов, {len(warnings)} предупреждений")
+        logger.info(f"[TASK {task_id[:8]}] Итого: {total} ответов "
+                    f"(рисков: {len(merged.get('risks', []))}, параметров: {len(merged.get('parameters', []))}), "
+                    f"{len(warnings)} предупреждений")
 
         # -- Готово --
         meta = {
@@ -392,10 +425,14 @@ async def process_task_parallel(task_id: str, saved_paths: list[Path], tmp_dir: 
             "context_chars": contract_chars + notice_chars + techspec_chars,
             "truncated": any(c > 0 for c in [contract_chars, notice_chars, techspec_chars]),
         }
-        text_report = format_checklist_report(all_results, warnings, meta)
+        text_report = format_checklist_report(merged, warnings, meta)
+        # Flat results для обратной совместимости
+        flat_results = merged.get("risks", []) + merged.get("parameters", [])
         task.update(
             status="done",
-            results=all_results,
+            results=flat_results,
+            risks=merged.get("risks", []),
+            parameters=merged.get("parameters", []),
             warnings=warnings,
             meta=meta,
             text=text_report,
@@ -409,7 +446,9 @@ async def process_task_parallel(task_id: str, saved_paths: list[Path], tmp_dir: 
                     await cb_client.post(callback_url, json={
                         "task_id": task_id,
                         "status": "done",
-                        "results": all_results,
+                        "risks": merged.get("risks", []),
+                        "parameters": merged.get("parameters", []),
+                        "results": flat_results,
                         "warnings": warnings,
                         "text": text_report,
                         "meta": meta,
@@ -628,6 +667,8 @@ async def get_status(task_id: str):
     if task["status"] == "done":
         return JSONResponse({
             "status": "done",
+            "risks": task.get("risks", []),
+            "parameters": task.get("parameters", []),
             "results": task.get("results"),
             "warnings": task.get("warnings", []),
             "text": task.get("text"),
