@@ -33,7 +33,7 @@ import os
 from pipeline.extractor import extract_files
 from pipeline.classifier import classify
 from pipeline.splitter import split_into_sections
-from pipeline.router import build_context
+from pipeline.router import build_context, extract_nacreg_paragraphs
 
 load_dotenv()
 
@@ -154,6 +154,13 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
         if not context:
             task.update(status="error", detail="Не удалось сформировать контекст из документов")
             return
+
+        # Принудительно добавляем абзацы про нацрежим
+        nacreg_extra = extract_nacreg_paragraphs(docs)
+        if nacreg_extra:
+            context = context + nacreg_extra
+            context_chars = len(context)
+            logger.info(f"[TASK {task_id[:8]}] Добавлены абзацы нацрежима: +{len(nacreg_extra)} симв.")
 
         logger.info(f"[TASK {task_id[:8]}] Контекст: {context_chars} символов, обрезан={truncated}")
 

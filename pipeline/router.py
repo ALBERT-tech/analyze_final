@@ -119,3 +119,39 @@ def build_context(
 
     context = "".join(context_parts).strip()
     return context, truncated, total_chars
+
+
+# -- Принудительный поиск нацрежима ----------------------------------------
+
+NACREG_KEYWORDS = ["1875", "925", "нацрежим", "национальн", "запрет", "ограничен", "преимуществ"]
+
+
+def extract_nacreg_paragraphs(docs: list[dict]) -> str:
+    """
+    Ищет абзацы про нацрежим по ВСЕМ документам.
+    Возвращает найденные абзацы как текст для вставки в контекст.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    for doc in docs:
+        for section in doc["sections"]:
+            # Разбиваем раздел на абзацы
+            paragraphs = section.text.split("\n")
+            for para in paragraphs:
+                para_lower = para.lower().strip()
+                if len(para_lower) < 20:
+                    continue
+                # Ищем ключевые слова нацрежима
+                hits = sum(1 for kw in NACREG_KEYWORDS if kw in para_lower)
+                if hits >= 1:
+                    # Дедупликация
+                    key = para_lower[:80]
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(para.strip())
+
+    if not found:
+        return ""
+
+    return "\n\n--- [НАЦРЕЖИМ — принудительно извлечённые абзацы] ---\n" + "\n".join(found)
