@@ -72,6 +72,55 @@ def cleanup_old_tasks():
 app = FastAPI(title="Анализатор тендерной документации")
 
 
+def _try_parse_json(content: str, task_id: str) -> list | None:
+    """Пытается распарсить JSON. При ошибке — ремонт и повтор."""
+    # Попытка 1: как есть
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Попытка 2: обрезаем до последнего полного объекта
+    try:
+        # Ищем последний }, после которого можно закрыть массив
+        last_brace = content.rfind("}")
+        if last_brace > 0:
+            repaired = content[:last_brace + 1].rstrip().rstrip(",") + "\n]"
+            # Убеждаемся что начинается с [
+            start = repaired.find("[")
+            if start >= 0:
+                repaired = repaired[start:]
+                parsed = json.loads(repaired)
+                if isinstance(parsed, list):
+                    logger.warning(f"[TASK {task_id[:8]}] JSON отремонтирован (обрезан до последнего объекта)")
+                    return parsed
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Попытка 3: вытаскиваем объекты по regex
+    try:
+        objects = re.findall(r'\{[^{}]*\}', content)
+        if objects:
+            results = []
+            for obj_str in objects:
+                try:
+                    obj = json.loads(obj_str)
+                    if "title" in obj and "answer" in obj:
+                        results.append(obj)
+                except json.JSONDecodeError:
+                    continue
+            if results:
+                logger.warning(f"[TASK {task_id[:8]}] JSON отремонтирован (regex, {len(results)} объектов)")
+                return results
+    except Exception:
+        pass
+
+    logger.error(f"[TASK {task_id[:8]}] Не удалось распарсить JSON:\n{content[:500]}")
+    return None
+
+
 def load_default_prompt() -> str:
     if DEFAULT_PROMPT_PATH.exists():
         return DEFAULT_PROMPT_PATH.read_text(encoding="utf-8")
@@ -209,12 +258,8 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
         json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
         clean_content = json_match.group(1).strip() if json_match else raw_content
 
-        try:
-            parsed = json.loads(clean_content)
-            if not isinstance(parsed, list):
-                raise ValueError("Ответ не является списком")
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"[TASK {task_id[:8]}] Ошибка парсинга JSON: {e}\nКонтент: {clean_content[:300]}")
+        parsed = _try_parse_json(clean_content, task_id)
+        if parsed is None:
             task.update(status="error", detail="Модель вернула некорректный JSON. Попробуйте ещё раз.")
             return
 
