@@ -68,14 +68,27 @@ FILENAME_SIGNALS: dict[str, list[str]] = {
 def classify(text: str, filename: str = "") -> str:
     """
     Возвращает тип документа: КОНТРАКТ | ТЗ | ИЗВЕЩЕНИЕ | ТРЕБОВАНИЯ | МУСОР | ПРОЧЕЕ
-    Сначала по содержимому, при ПРОЧЕЕ — фолбэк по имени файла.
+    Приоритет: имя файла (если чёткое совпадение) → содержимое → фолбэк по имени.
     """
-    sample = text[:6000].lower()
+    # Шаг 0: Чёткое совпадение по имени файла (приоритет над контентом)
+    if filename:
+        name_lower = filename.lower()
+        # Контракт/договор в имени — почти наверняка контракт
+        for signal in FILENAME_SIGNALS.get("КОНТРАКТ", []):
+            if signal in name_lower:
+                return "КОНТРАКТ"
+        # Извещение в имени
+        for signal in FILENAME_SIGNALS.get("ИЗВЕЩЕНИЕ", []):
+            if signal in name_lower:
+                return "ИЗВЕЩЕНИЕ"
 
+    # Шаг 1: Проверка мусора
+    sample = text[:6000].lower()
     for signal in JUNK_SIGNALS:
         if signal in sample:
             return "МУСОР"
 
+    # Шаг 2: Контентная классификация
     scores: dict[str, int] = {}
     for doc_type, signals in DOC_TYPE_SIGNALS.items():
         scores[doc_type] = sum(1 for s in signals if s in sample)
@@ -84,13 +97,12 @@ def classify(text: str, filename: str = "") -> str:
     if best_score > 0:
         return best_type
 
-    # Фолбэк: классификация по имени файла
+    # Шаг 3: Фолбэк по имени файла для ТЗ/ООЗ
     if filename:
         name_lower = filename.lower()
-        for doc_type, signals in FILENAME_SIGNALS.items():
-            for signal in signals:
-                if signal in name_lower:
-                    return doc_type
+        for signal in FILENAME_SIGNALS.get("ТЗ", []):
+            if signal in name_lower:
+                return "ТЗ"
 
     return "ПРОЧЕЕ"
 
