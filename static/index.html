@@ -173,7 +173,7 @@ footer a { color:var(--primary); text-decoration:none; }
       <div class="step pending" id="s2">Извлечение текста из документов</div>
       <div class="step pending" id="s3">Классификация и нарезка на разделы</div>
       <div class="step pending" id="s4">Маршрутизация и сборка контекста</div>
-      <div class="step pending" id="s5">Запрос к DeepSeek</div>
+      <div class="step pending" id="s5">Запросы к DeepSeek (4 параллельных)</div>
       <div class="step pending" id="s6">Формирование отчёта</div>
     </div>
   </div>
@@ -356,7 +356,7 @@ async function runAnalysis() {
 
     lastResults = data.results;
     lastMeta = data.meta;
-    renderResults(data.results, data.meta);
+    renderResults(data, data.meta);
 
   } catch(e) {
     allSteps('pending');
@@ -428,9 +428,22 @@ function showError(msg) {
 }
 
 // ── Рендер результатов ────────────────────────────────────
-function renderResults(items, meta) {
+function renderResults(data, meta) {
   const container = document.getElementById('resultsContainer');
   container.innerHTML = '';
+
+  const items = data.results || data;
+  const warnings = data.warnings || [];
+
+  // Предупреждения
+  if (warnings.length) {
+    const warnDiv = document.createElement('div');
+    warnDiv.className = 'skipped-list';
+    warnDiv.innerHTML = `<strong>Предупреждения:</strong><ul>${
+      warnings.map(w => `<li>${esc(w)}</li>`).join('')
+    }</ul>`;
+    container.appendChild(warnDiv);
+  }
 
   // Пропущенные файлы
   if (meta?.skipped?.length) {
@@ -452,11 +465,22 @@ function renderResults(items, meta) {
   document.getElementById('resultsMeta').textContent = `${now}  ·  ${fileLabels}`;
   document.getElementById('resultsHdr').style.display = 'flex';
 
+  // Группируем по source
+  let currentSource = null;
   items.forEach(item => {
+    const source = item.source || '';
+    if (source && source !== currentSource) {
+      currentSource = source;
+      const hdr = document.createElement('div');
+      hdr.style.cssText = 'font-weight:600;font-size:15px;margin:20px 0 10px;padding:8px 12px;background:var(--primary-light);border-radius:var(--radius);color:var(--primary);';
+      hdr.textContent = source;
+      container.appendChild(hdr);
+    }
+
     const card = document.createElement('div');
     card.className = 'result-card';
     const notFound = !item.answer || item.answer.toLowerCase().includes('не найден');
-    let html = `<div class="result-title">${esc(item.title || '—')}</div>`;
+    let html = `<div class="result-title">${esc(item.title || '')}</div>`;
     if (notFound) {
       html += `<div class="result-notfound">Информация не найдена в документации</div>`;
     } else {

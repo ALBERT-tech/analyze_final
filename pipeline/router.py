@@ -155,3 +155,99 @@ def extract_nacreg_paragraphs(docs: list[dict]) -> str:
         return ""
 
     return "\n\n--- [НАЦРЕЖИМ — принудительно извлечённые абзацы] ---\n" + "\n".join(found)
+
+
+# -- Типовые ключевые слова для контекстов по типам документов ----------------
+
+CONTRACT_KEYWORDS: list[str] = [
+    "штраф", "пен", "неустойк", "санкц", "ответственност",
+    "оплат", "расчёт", "расчет", "платёж", "платеж",
+    "обеспечен", "банковск", "гарантия", "залог",
+    "исполнен", "приёмк", "приемк", "срок", "поставк",
+    "документ", "накладн", "сертификат", "паспорт",
+    "качеств", "верхн", "предел", "не более",
+    "актуальн", "интерес", "отказ",
+]
+
+NOTICE_KEYWORDS: list[str] = [
+    "нацрежим", "национальн", "1875", "925",
+    "запрет", "ограничен", "преимуществ",
+    "обеспечен", "гарантия", "банковск",
+    "казначейск", "гособоронзаказ", "гоз", "275-фз", "упз",
+    "аналог", "эквивалент",
+    "начальн", "максимальн", "нмц",
+]
+
+TECHSPEC_KEYWORDS: list[str] = [
+    "место поставк", "адрес", "получател", "склад", "доставк",
+    "гарантий", "гарантия", "срок",
+    "документ", "сертификат", "паспорт", "поверк", "удостоверен",
+    "аналог", "эквивалент",
+    "казначейск", "гособоронзаказ", "гоз", "275-фз", "упз",
+]
+
+
+def build_context_for_type(
+    docs: list[dict],
+    target_types: list[str],
+    max_chars: int = 60_000,
+    keywords: list[str] | None = None,
+) -> tuple[str, bool, int]:
+    """
+    Строит контекст только из документов указанных типов.
+
+    Args:
+        docs: все документы [{name, type, sections, char_count}]
+        target_types: ["КОНТРАКТ"], ["ИЗВЕЩЕНИЕ", "ТРЕБОВАНИЯ"], ["ТЗ"]
+        max_chars: лимит символов
+        keywords: ключевые слова для ранжирования (если None — SECTION_KEYWORDS)
+
+    Returns:
+        (context, truncated, char_count)
+    """
+    filtered = [d for d in docs if d["type"] in target_types]
+    if not filtered:
+        return "", False, 0
+
+    kw = keywords or SECTION_KEYWORDS
+
+    ranked: list[RankedSection] = []
+    for doc in filtered:
+        for section in doc["sections"]:
+            text_lower = section.text.lower()
+            score = sum(1 for k in kw if k in text_lower)
+            ranked.append(RankedSection(
+                doc_name=doc["name"],
+                doc_type=doc["type"],
+                section=section,
+                score=score,
+            ))
+
+    ranked.sort(key=lambda r: -r.score)
+
+    context_parts: list[str] = []
+    total_chars = 0
+    truncated = False
+
+    for ranked_sec in ranked:
+        block = (
+            f"\n\n--- [{ranked_sec.doc_name}] "
+            f"Раздел: {ranked_sec.section.heading} ---\n"
+            f"{ranked_sec.section.text}"
+        )
+
+        if total_chars + len(block) > max_chars:
+            if ranked_sec.score >= 2:
+                remaining = max_chars - total_chars - 120
+                if remaining > 300:
+                    block = block[:remaining] + "\n...[обрезано]"
+                    context_parts.append(block)
+                    total_chars += len(block)
+            truncated = True
+            break
+
+        context_parts.append(block)
+        total_chars += len(block)
+
+    context = "".join(context_parts).strip()
+    return context, truncated, total_chars

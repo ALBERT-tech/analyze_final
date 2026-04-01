@@ -1,15 +1,14 @@
 """
-main.py — FastAPI сервер анализатора тендерной документации.
+main.py — FastAPI-сервер анализатора тендерной документации.
 
-Запуск:
-    uvicorn main:app --reload --host 0.0.0.0 --port 8000
+Архитектура v2: 4 параллельных запроса к DeepSeek по типам документов.
 
 Эндпоинты:
-    GET  /              → HTML интерфейс
-    POST /analyze       → загрузка файлов (браузер), возврат task_id + polling
-    GET  /status/{id}   → текущий статус задачи (polling)
-    POST /api/analyze   → JSON с URL файлов (Битрикс и др.), callback по готовности
-    GET  /prompt        → текущий промпт по умолчанию
+    GET  /              — HTML-интерфейс
+    POST /analyze       — загрузка файлов (браузер), возврат task_id + polling
+    GET  /status/{id}   — текущий статус задачи (polling)
+    POST /api/analyze   — JSON с URL файлов (Битрикс и др.), callback по готовности
+    GET  /prompt        — текущий промпт по умолчанию
 """
 
 import asyncio
@@ -33,7 +32,10 @@ import os
 from pipeline.extractor import extract_files
 from pipeline.classifier import classify
 from pipeline.splitter import split_into_sections
-from pipeline.router import build_context, extract_nacreg_paragraphs
+from pipeline.router import (
+    build_context, build_context_for_type, extract_nacreg_paragraphs,
+    CONTRACT_KEYWORDS, NOTICE_KEYWORDS, TECHSPEC_KEYWORDS,
+)
 
 load_dotenv()
 
@@ -41,25 +43,33 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 # -- Конфиг ---------------------------------------------------------------
-API_KEY           = os.getenv("API_KEY", "")
-API_URL           = os.getenv("API_URL", "https://litellm.tokengate.ru/v1/chat/completions")
-MODEL             = os.getenv("MODEL", "deepseek/deepseek-chat")
-MAX_TOKENS        = int(os.getenv("MAX_TOKENS", "2000"))
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "80000"))
+API_KEY                = os.getenv("API_KEY", "")
+API_URL                = os.getenv("API_URL", "https://litellm.tokengate.ru/v1/chat/completions")
+MODEL                  = os.getenv("MODEL", "deepseek/deepseek-chat")
+MAX_TOKENS             = int(os.getenv("MAX_TOKENS", "2000"))
+MAX_TOKENS_PER_CALL    = int(os.getenv("MAX_TOKENS_PER_CALL", "4000"))
+MAX_CONTEXT_CHARS      = int(os.getenv("MAX_CONTEXT_CHARS", "80000"))
+MAX_CONTEXT_PER_CALL   = int(os.getenv("MAX_CONTEXT_CHARS_PER_CALL", "60000"))
 
 DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
 
+# Промпты для 4 параллельных запросов
+TYPED_PROMPTS = {
+    "contract_risks":  Path("prompts/contract_risks.txt"),
+    "contract_params": Path("prompts/contract_params.txt"),
+    "notice":          Path("prompts/notice.txt"),
+    "techspec":        Path("prompts/techspec.txt"),
+}
+
 # -- Хранилище задач (in-memory) ------------------------------------------
 tasks: dict[str, dict] = {}
-TASK_TTL = 1800  # 30 мин — потом удаляем
+TASK_TTL = 1800
 
 
 def cleanup_old_tasks():
-    """Удаляет задачи старше TASK_TTL."""
     now = time.time()
     expired = [tid for tid, t in tasks.items() if now - t.get("created", 0) > TASK_TTL]
     for tid in expired:
-        # Удаляем временные файлы если остались
         tmp_dir = tasks[tid].get("tmp_dir")
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -69,11 +79,13 @@ def cleanup_old_tasks():
 
 
 # -- FastAPI ---------------------------------------------------------------
-app = FastAPI(title="Анализатор тендерной документации")
+app = FastAPI(title="Анализатор тендерной документации v2")
 
+
+# -- Утилиты ---------------------------------------------------------------
 
 def _try_parse_json(content: str, task_id: str) -> list | None:
-    """Пытается распарсить JSON. При ошибке — ремонт и повтор."""
+    """Пытается распарсить JSON-массив. При ошибке — ремонт и повтор."""
     # Попытка 1: как есть
     try:
         parsed = json.loads(content)
@@ -84,22 +96,20 @@ def _try_parse_json(content: str, task_id: str) -> list | None:
 
     # Попытка 2: обрезаем до последнего полного объекта
     try:
-        # Ищем последний }, после которого можно закрыть массив
         last_brace = content.rfind("}")
         if last_brace > 0:
             repaired = content[:last_brace + 1].rstrip().rstrip(",") + "\n]"
-            # Убеждаемся что начинается с [
             start = repaired.find("[")
             if start >= 0:
                 repaired = repaired[start:]
                 parsed = json.loads(repaired)
                 if isinstance(parsed, list):
-                    logger.warning(f"[TASK {task_id[:8]}] JSON отремонтирован (обрезан до последнего объекта)")
+                    logger.warning(f"[TASK {task_id[:8]}] JSON отремонтирован (обрезан)")
                     return parsed
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Попытка 3: вытаскиваем объекты по regex
+    # Попытка 3: regex
     try:
         objects = re.findall(r'\{[^{}]*\}', content)
         if objects:
@@ -121,63 +131,140 @@ def _try_parse_json(content: str, task_id: str) -> list | None:
     return None
 
 
-def _format_results_text(results: list, meta: dict) -> str:
-    """Форматирует результаты в читаемый текст для Битрикс."""
-    lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
-
-    files = meta.get("files", [])
-    if files:
-        names = ", ".join(f["name"] for f in files)
-        lines.append(f"Файлы: {names}")
-        lines.append("")
-
-    for i, item in enumerate(results, 1):
-        title = item.get("title", "")
-        answer = item.get("answer", "")
-        citation = item.get("citation", "")
-
-        lines.append(f"{i}. {title}")
-        lines.append(f"   {answer}")
-        if citation and citation != "—":
-            lines.append(f"   [{citation}]")
-        lines.append("")
-
-    return "\n".join(lines).strip()
-
-
 def load_default_prompt() -> str:
     if DEFAULT_PROMPT_PATH.exists():
         return DEFAULT_PROMPT_PATH.read_text(encoding="utf-8")
     return "Проанализируй документацию и ответь на вопросы.\n\n{{CONTRACT_TEXT}}"
 
 
-# -- Модель запроса для API (Битрикс и др.) --------------------------------
+def load_typed_prompt(prompt_type: str) -> str:
+    """Загружает промпт по типу (contract_risks, contract_params, notice, techspec)."""
+    path = TYPED_PROMPTS.get(prompt_type)
+    if path and path.exists():
+        return path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Промпт не найден: {prompt_type} ({path})")
 
-class ApiAnalyzeRequest(BaseModel):
-    files: list[str]                # URL-ссылки на файлы
-    callback_url: str | None = None # Куда отправить результат
-    prompt: str | None = None       # Кастомный промпт (необязательно)
+
+# -- Вызов DeepSeek API ---------------------------------------------------
+
+async def call_deepseek(prompt_text: str, task_id: str, label: str) -> list | None:
+    """Один вызов DeepSeek API. Возвращает распарсенный JSON-массив или None."""
+    logger.info(f"[TASK {task_id[:8]}] [{label}] Отправка в API ({len(prompt_text)} симв.)")
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                API_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {API_KEY}",
+                },
+                json={
+                    "model": MODEL,
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    "temperature": 0.1,
+                    "max_tokens": MAX_TOKENS_PER_CALL,
+                },
+            )
+
+        if response.status_code != 200:
+            err_body = response.text[:300]
+            logger.error(f"[TASK {task_id[:8]}] [{label}] API ошибка {response.status_code}: {err_body}")
+            return None
+
+        data = response.json()
+        raw_content = data["choices"][0]["message"]["content"].strip()
+        logger.info(f"[TASK {task_id[:8]}] [{label}] Ответ получен ({len(raw_content)} симв.)")
+
+        # Чистим markdown-обёртки
+        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
+        clean_content = json_match.group(1).strip() if json_match else raw_content
+
+        parsed = _try_parse_json(clean_content, task_id)
+        if parsed:
+            logger.info(f"[TASK {task_id[:8]}] [{label}] Распарсено {len(parsed)} объектов")
+        return parsed
+
+    except Exception as e:
+        logger.error(f"[TASK {task_id[:8]}] [{label}] Ошибка: {e}")
+        return None
 
 
-def format_results_text(results: list[dict]) -> str:
-    """Форматирует результаты в читаемый текст для Битрикса."""
-    lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", "=" * 40, ""]
-    for i, item in enumerate(results, 1):
-        title = item.get("title", "—")
-        answer = item.get("answer", "—")
-        citation = item.get("citation", "")
-        lines.append(f"{i}. {title}")
-        lines.append(f"   Ответ: {answer}")
-        if citation and citation.strip() not in ("—", ""):
-            lines.append(f"   Цитата: {citation}")
+# -- Мерж результатов ------------------------------------------------------
+
+def merge_results(api_results: dict[str, list | None]) -> tuple[list, list]:
+    """
+    Объединяет результаты 4 запросов в единый список.
+    Добавляет поле source к каждому элементу.
+
+    Returns:
+        (all_results, warnings)
+    """
+    all_results = []
+    warnings = []
+
+    source_labels = {
+        "contract_risks":  "КОНТРАКТ (риски)",
+        "contract_params": "КОНТРАКТ (параметры)",
+        "notice":          "ИЗВЕЩЕНИЕ",
+        "techspec":        "ТЗ",
+    }
+
+    for key, label in source_labels.items():
+        items = api_results.get(key)
+        if items is None:
+            warnings.append(f"Не удалось проанализировать: {label}")
+            continue
+        for item in items:
+            item["source"] = label
+            all_results.append(item)
+
+    return all_results, warnings
+
+
+def format_checklist_report(results: list, warnings: list, meta: dict) -> str:
+    """Форматирует результаты в текстовый отчёт с секциями по источникам."""
+    lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
+
+    files = meta.get("files", [])
+    if files:
+        names = ", ".join(f'{f["name"]} ({f["type"]})' for f in files)
+        lines.append(f"Файлы: {names}")
         lines.append("")
-    return "\n".join(lines)
+
+    if warnings:
+        for w in warnings:
+            lines.append(f"!!! {w}")
+        lines.append("")
+
+    # Группируем по source
+    current_source = None
+    num = 0
+    for item in results:
+        source = item.get("source", "")
+        if source != current_source:
+            current_source = source
+            lines.append(f"=== {source} ===")
+            lines.append("")
+
+        num += 1
+        title = item.get("title", "")
+        answer = item.get("answer", "")
+        citation = item.get("citation", "")
+
+        lines.append(f"{num}. {title}")
+        lines.append(f"   {answer}")
+        if citation and citation != "---":
+            lines.append(f"   [{citation}]")
+        lines.append("")
+
+    return "\n".join(lines).strip()
 
 
-# -- Фоновая обработка задачи ---------------------------------------------
+# -- Основной pipeline (4 параллельных запроса) ----------------------------
 
-async def process_task(task_id: str, saved_paths: list[Path], prompt_template: str, tmp_dir: Path):
-    """Весь pipeline в фоне. Обновляет tasks[task_id] на каждом шаге."""
+async def process_task_parallel(task_id: str, saved_paths: list[Path], tmp_dir: Path):
+    """Pipeline v2: 4 параллельных запроса к DeepSeek."""
     try:
         task = tasks[task_id]
 
@@ -209,7 +296,7 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
 
         docs = []
         for f in valid:
-            doc_type = classify(f.text)
+            doc_type = classify(f.text, f.name)
             sections = split_into_sections(f.text)
             docs.append({
                 "name": f.name,
@@ -219,87 +306,102 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
             })
             logger.info(f"[TASK {task_id[:8]}] {f.name}: тип={doc_type}, разделов={len(sections)}")
 
-        # -- Шаг 4: Сборка контекста --
-        task.update(step="context", detail="Сборка контекста для модели...")
+        # -- Шаг 4: Сборка контекстов по типам --
+        task.update(step="context", detail="Сборка контекстов по типам документов...")
 
-        context, truncated, context_chars = build_context(docs, max_chars=MAX_CONTEXT_CHARS)
+        contract_ctx, _, contract_chars = build_context_for_type(
+            docs, ["КОНТРАКТ"], MAX_CONTEXT_PER_CALL, CONTRACT_KEYWORDS
+        )
+        notice_ctx, _, notice_chars = build_context_for_type(
+            docs, ["ИЗВЕЩЕНИЕ", "ТРЕБОВАНИЯ"], MAX_CONTEXT_PER_CALL, NOTICE_KEYWORDS
+        )
+        techspec_ctx, _, techspec_chars = build_context_for_type(
+            docs, ["ТЗ"], MAX_CONTEXT_PER_CALL, TECHSPEC_KEYWORDS
+        )
 
-        if not context:
+        logger.info(f"[TASK {task_id[:8]}] Контексты: "
+                    f"контракт={contract_chars}, извещение={notice_chars}, ТЗ={techspec_chars}")
+
+        if not contract_ctx and not notice_ctx and not techspec_ctx:
             task.update(status="error", detail="Не удалось сформировать контекст из документов")
             return
 
-        # Принудительно добавляем абзацы про нацрежим
-        nacreg_extra = extract_nacreg_paragraphs(docs)
-        if nacreg_extra:
-            context = context + nacreg_extra
-            context_chars = len(context)
-            logger.info(f"[TASK {task_id[:8]}] Добавлены абзацы нацрежима: +{len(nacreg_extra)} симв.")
+        # -- Шаг 5: 4 параллельных запроса к DeepSeek --
+        task.update(step="api", detail="Запросы к DeepSeek (4 параллельных)...")
 
-        logger.info(f"[TASK {task_id[:8]}] Контекст: {context_chars} символов, обрезан={truncated}")
+        coros = {}
 
-        # -- Шаг 5: DeepSeek API --
-        task.update(step="api", detail="Запрос к DeepSeek...")
+        if contract_ctx:
+            try:
+                p1 = load_typed_prompt("contract_risks").replace("{{CONTRACT_TEXT}}", contract_ctx)
+                coros["contract_risks"] = call_deepseek(p1, task_id, "КОНТРАКТ-РИСКИ")
+            except FileNotFoundError:
+                logger.warning(f"[TASK {task_id[:8]}] Промпт contract_risks не найден")
 
-        final_prompt = prompt_template.replace("{{CONTRACT_TEXT}}", context)
-        logger.info(f"[TASK {task_id[:8]}] Отправка в API: модель={MODEL}, промпт={len(final_prompt)} симв.")
+            try:
+                p2 = load_typed_prompt("contract_params").replace("{{CONTRACT_TEXT}}", contract_ctx)
+                coros["contract_params"] = call_deepseek(p2, task_id, "КОНТРАКТ-ПАРАМЕТРЫ")
+            except FileNotFoundError:
+                logger.warning(f"[TASK {task_id[:8]}] Промпт contract_params не найден")
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(
-                API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {API_KEY}",
-                },
-                json={
-                    "model": MODEL,
-                    "messages": [{"role": "user", "content": final_prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": MAX_TOKENS,
-                },
-            )
+        if notice_ctx:
+            try:
+                p3 = load_typed_prompt("notice").replace("{{CONTRACT_TEXT}}", notice_ctx)
+                coros["notice"] = call_deepseek(p3, task_id, "ИЗВЕЩЕНИЕ")
+            except FileNotFoundError:
+                logger.warning(f"[TASK {task_id[:8]}] Промпт notice не найден")
 
-        if response.status_code != 200:
-            err_body = response.text[:500]
-            logger.error(f"[TASK {task_id[:8]}] API ошибка {response.status_code}: {err_body}")
-            # Понятное сообщение при превышении контекста
-            if "max_n" in err_body or "context" in err_body.lower() or "token" in err_body.lower():
-                task.update(status="error", detail=(
-                    "Документация слишком большая для модели. "
-                    "Попробуйте загрузить меньше файлов или только ключевые документы "
-                    "(контракт + ТЗ), без вспомогательных."
-                ))
-            else:
-                task.update(status="error", detail=f"Ошибка API модели: {err_body[:200]}")
+        if techspec_ctx:
+            try:
+                p4 = load_typed_prompt("techspec").replace("{{CONTRACT_TEXT}}", techspec_ctx)
+                coros["techspec"] = call_deepseek(p4, task_id, "ТЗ")
+            except FileNotFoundError:
+                logger.warning(f"[TASK {task_id[:8]}] Промпт techspec не найден")
+
+        if not coros:
+            task.update(status="error", detail="Не удалось подготовить ни одного запроса к модели")
             return
 
-        data = response.json()
-        raw_content = data["choices"][0]["message"]["content"].strip()
-        logger.info(f"[TASK {task_id[:8]}] API ответ получен ({len(raw_content)} символов)")
+        # Параллельный запуск
+        keys = list(coros.keys())
+        results_list = await asyncio.gather(*coros.values(), return_exceptions=True)
 
-        # -- Шаг 6: Парсинг JSON --
+        api_results = {}
+        for key, result in zip(keys, results_list):
+            if isinstance(result, Exception):
+                logger.error(f"[TASK {task_id[:8]}] [{key}] Ошибка: {result}")
+                api_results[key] = None
+            else:
+                api_results[key] = result
+
+        # -- Шаг 6: Мерж результатов --
         task.update(step="parsing", detail="Формирование отчёта...")
 
-        json_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw_content)
-        clean_content = json_match.group(1).strip() if json_match else raw_content
+        all_results, warnings = merge_results(api_results)
 
-        parsed = _try_parse_json(clean_content, task_id)
-        if parsed is None:
-            task.update(status="error", detail="Модель вернула некорректный JSON. Попробуйте ещё раз.")
+        if not all_results:
+            task.update(status="error", detail="Модель не вернула ни одного ответа. Попробуйте ещё раз.")
             return
 
-        logger.info(f"[TASK {task_id[:8]}] JSON распарсен, элементов: {len(parsed)}")
+        logger.info(f"[TASK {task_id[:8]}] Итого: {len(all_results)} ответов, {len(warnings)} предупреждений")
 
         # -- Готово --
         meta = {
             "files": [{"name": d["name"], "type": d["type"], "chars": d["char_count"]} for d in docs],
             "skipped": skipped,
-            "context_chars": context_chars,
-            "truncated": truncated,
+            "context_chars": contract_chars + notice_chars + techspec_chars,
+            "truncated": any(c > 0 for c in [contract_chars, notice_chars, techspec_chars]),
         }
-        text_report = _format_results_text(parsed, meta)
-        task.update(status="done", results=parsed, meta=meta, text=text_report)
+        text_report = format_checklist_report(all_results, warnings, meta)
+        task.update(
+            status="done",
+            results=all_results,
+            warnings=warnings,
+            meta=meta,
+            text=text_report,
+        )
 
-        # -- Callback (для Битрикса и др.) --
+        # -- Callback --
         callback_url = task.get("callback_url")
         if callback_url:
             try:
@@ -307,7 +409,8 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
                     await cb_client.post(callback_url, json={
                         "task_id": task_id,
                         "status": "done",
-                        "results": parsed,
+                        "results": all_results,
+                        "warnings": warnings,
                         "text": text_report,
                         "meta": meta,
                     })
@@ -319,21 +422,118 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
         logger.error(f"[TASK {task_id[:8]}] Необработанная ошибка: {e}", exc_info=True)
         tasks[task_id].update(status="error", detail=f"Внутренняя ошибка сервера: {str(e)[:200]}")
 
-        # Callback при ошибке
         callback_url = tasks[task_id].get("callback_url")
         if callback_url:
             try:
                 async with httpx.AsyncClient(timeout=30.0) as cb_client:
                     await cb_client.post(callback_url, json={
-                        "task_id": task_id,
-                        "status": "error",
-                        "detail": str(e)[:200],
+                        "task_id": task_id, "status": "error", "detail": str(e)[:200],
                     })
             except Exception:
                 pass
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# -- Legacy pipeline (один запрос, для кастомных промптов) -----------------
+
+async def process_task_legacy(task_id: str, saved_paths: list[Path], prompt_template: str, tmp_dir: Path):
+    """Старый pipeline: один запрос с кастомным промптом."""
+    try:
+        task = tasks[task_id]
+
+        task.update(status="processing", step="extracting", detail="Извлечение текста из документов...")
+        extracted = await asyncio.to_thread(extract_files, saved_paths)
+
+        if not extracted:
+            task.update(status="error", detail="Не удалось извлечь текст ни из одного файла")
+            return
+
+        skipped = [{"name": f.name, "reason": f.skip_reason} for f in extracted if f.skipped]
+        valid = [f for f in extracted if not f.skipped and f.text.strip()]
+
+        if not valid:
+            task.update(status="error", detail="Нет пригодных для анализа файлов.")
+            return
+
+        task.update(step="classifying", detail="Классификация и нарезка на разделы...")
+        docs = []
+        for f in valid:
+            doc_type = classify(f.text, f.name)
+            sections = split_into_sections(f.text)
+            docs.append({"name": f.name, "type": doc_type, "sections": sections, "char_count": len(f.text)})
+
+        task.update(step="context", detail="Сборка контекста для модели...")
+        context, truncated, context_chars = build_context(docs, max_chars=MAX_CONTEXT_CHARS)
+
+        nacreg_extra = extract_nacreg_paragraphs(docs)
+        if nacreg_extra:
+            context = context + nacreg_extra
+            context_chars = len(context)
+
+        if not context:
+            task.update(status="error", detail="Не удалось сформировать контекст")
+            return
+
+        task.update(step="api", detail="Запрос к DeepSeek...")
+        final_prompt = prompt_template.replace("{{CONTRACT_TEXT}}", context)
+
+        parsed = await call_deepseek(final_prompt, task_id, "LEGACY")
+
+        if not parsed:
+            task.update(status="error", detail="Модель вернула некорректный ответ. Попробуйте ещё раз.")
+            return
+
+        task.update(step="parsing", detail="Формирование отчёта...")
+
+        meta = {
+            "files": [{"name": d["name"], "type": d["type"], "chars": d["char_count"]} for d in docs],
+            "skipped": skipped,
+            "context_chars": context_chars,
+            "truncated": truncated,
+        }
+
+        lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
+        files_str = ", ".join(f["name"] for f in meta["files"])
+        if files_str:
+            lines.append(f"Файлы: {files_str}")
+            lines.append("")
+        for i, item in enumerate(parsed, 1):
+            lines.append(f'{i}. {item.get("title", "")}')
+            lines.append(f'   {item.get("answer", "")}')
+            cit = item.get("citation", "")
+            if cit and cit != "---":
+                lines.append(f"   [{cit}]")
+            lines.append("")
+        text_report = "\n".join(lines).strip()
+
+        task.update(status="done", results=parsed, meta=meta, text=text_report)
+
+        callback_url = task.get("callback_url")
+        if callback_url:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as cb_client:
+                    await cb_client.post(callback_url, json={
+                        "task_id": task_id, "status": "done",
+                        "results": parsed, "text": text_report, "meta": meta,
+                    })
+            except Exception as cb_err:
+                logger.error(f"[TASK {task_id[:8]}] Ошибка callback: {cb_err}")
+
+    except Exception as e:
+        logger.error(f"[TASK {task_id[:8]}] Ошибка: {e}", exc_info=True)
+        tasks[task_id].update(status="error", detail=str(e)[:200])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# -- Модель запроса для API ------------------------------------------------
+
+class ApiAnalyzeRequest(BaseModel):
+    files: list[str]
+    callback_url: str | None = None
+    prompt: str | None = None
 
 
 # -- Эндпоинты ------------------------------------------------------------
@@ -369,17 +569,18 @@ async def analyze(
     files: list[UploadFile] = File(...),
     prompt: str = Form(None),
 ):
-    """Принимает файлы, запускает фоновую обработку, возвращает task_id."""
+    """Принимает файлы, запускает обработку, возвращает task_id."""
     if not files:
         raise HTTPException(status_code=400, detail="Файлы не переданы")
 
-    # Чистим старые задачи
     cleanup_old_tasks()
 
-    # Промпт
-    prompt_template = prompt.strip() if prompt and prompt.strip() else load_default_prompt()
-    if "{{CONTRACT_TEXT}}" not in prompt_template:
-        raise HTTPException(status_code=400, detail="В промпте отсутствует метка {{CONTRACT_TEXT}}")
+    # Определяем: кастомный промпт или стандартный pipeline
+    custom_prompt = None
+    if prompt and prompt.strip():
+        custom_prompt = prompt.strip()
+        if "{{CONTRACT_TEXT}}" not in custom_prompt:
+            raise HTTPException(status_code=400, detail="В промпте отсутствует метка {{CONTRACT_TEXT}}")
 
     # Сохраняем файлы
     tmp_dir = Path(tempfile.mkdtemp())
@@ -401,10 +602,14 @@ async def analyze(
         "tmp_dir": str(tmp_dir),
     }
 
-    # Запускаем в фоне
-    asyncio.create_task(process_task(task_id, saved_paths, prompt_template, tmp_dir))
+    # Выбираем pipeline
+    if custom_prompt:
+        asyncio.create_task(process_task_legacy(task_id, saved_paths, custom_prompt, tmp_dir))
+        logger.info(f"[TASK {task_id[:8]}] Задача создана (LEGACY), файлов: {len(saved_paths)}")
+    else:
+        asyncio.create_task(process_task_parallel(task_id, saved_paths, tmp_dir))
+        logger.info(f"[TASK {task_id[:8]}] Задача создана (4-PARALLEL), файлов: {len(saved_paths)}")
 
-    logger.info(f"[TASK {task_id[:8]}] Задача создана, файлов: {len(saved_paths)}")
     return JSONResponse({"task_id": task_id})
 
 
@@ -419,6 +624,7 @@ async def get_status(task_id: str):
         return JSONResponse({
             "status": "done",
             "results": task.get("results"),
+            "warnings": task.get("warnings", []),
             "text": task.get("text"),
             "meta": task.get("meta"),
         })
@@ -437,21 +643,19 @@ async def get_status(task_id: str):
 
 @app.post("/api/analyze")
 async def api_analyze(req: ApiAnalyzeRequest):
-    """
-    API для Битрикса и внешних систем.
-    Принимает JSON с URL файлов, скачивает, обрабатывает, отправляет результат на callback_url.
-    """
+    """API для Битрикса: JSON с URL файлов, скачивание, обработка, callback."""
     if not req.files:
         raise HTTPException(status_code=400, detail="Список файлов пуст")
 
     cleanup_old_tasks()
 
-    # Промпт
-    prompt_template = req.prompt.strip() if req.prompt and req.prompt.strip() else load_default_prompt()
-    if "{{CONTRACT_TEXT}}" not in prompt_template:
-        raise HTTPException(status_code=400, detail="В промпте отсутствует метка {{CONTRACT_TEXT}}")
+    custom_prompt = None
+    if req.prompt and req.prompt.strip():
+        custom_prompt = req.prompt.strip()
+        if "{{CONTRACT_TEXT}}" not in custom_prompt:
+            raise HTTPException(status_code=400, detail="В промпте отсутствует метка {{CONTRACT_TEXT}}")
 
-    # Скачиваем файлы по URL
+    # Скачиваем файлы
     tmp_dir = Path(tempfile.mkdtemp())
     saved_paths: list[Path] = []
 
@@ -465,7 +669,6 @@ async def api_analyze(req: ApiAnalyzeRequest):
                     logger.error(f"[API] Не удалось скачать {url}: {e}")
                     continue
 
-                # Имя файла из URL
                 filename = url.split("/")[-1].split("?")[0]
                 if not filename:
                     filename = f"file_{len(saved_paths)}"
@@ -473,16 +676,14 @@ async def api_analyze(req: ApiAnalyzeRequest):
                 dest.write_bytes(resp.content)
                 saved_paths.append(dest)
                 logger.info(f"[API] Скачан: {filename} ({len(resp.content)} байт)")
-
     except Exception as e:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Ошибка при скачивании файлов: {str(e)[:200]}")
+        raise HTTPException(status_code=500, detail=f"Ошибка скачивания: {str(e)[:200]}")
 
     if not saved_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="Не удалось скачать ни одного файла")
 
-    # Создаём задачу
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
         "status": "processing",
@@ -493,8 +694,10 @@ async def api_analyze(req: ApiAnalyzeRequest):
         "callback_url": req.callback_url,
     }
 
-    # Запускаем в фоне
-    asyncio.create_task(process_task(task_id, saved_paths, prompt_template, tmp_dir))
+    if custom_prompt:
+        asyncio.create_task(process_task_legacy(task_id, saved_paths, custom_prompt, tmp_dir))
+    else:
+        asyncio.create_task(process_task_parallel(task_id, saved_paths, tmp_dir))
 
     logger.info(f"[API TASK {task_id[:8]}] Задача создана, файлов: {len(saved_paths)}, "
                 f"callback: {req.callback_url or 'нет'}")

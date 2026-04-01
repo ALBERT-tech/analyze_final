@@ -53,9 +53,22 @@ JUNK_SIGNALS: list[str] = [
 ]
 
 
-def classify(text: str) -> str:
+# Фолбэк-классификация по имени файла
+FILENAME_SIGNALS: dict[str, list[str]] = {
+    "КОНТРАКТ": ["контракт", "договор", "проект контракта", "проект договора"],
+    "ТЗ": [
+        "техническое задание", "тех. задание", "тех задание",
+        "описание объекта", "ооз", "описание закупки",
+        "спецификация", "техническая часть",
+    ],
+    "ИЗВЕЩЕНИЕ": ["извещение"],
+}
+
+
+def classify(text: str, filename: str = "") -> str:
     """
     Возвращает тип документа: КОНТРАКТ | ТЗ | ИЗВЕЩЕНИЕ | ТРЕБОВАНИЯ | МУСОР | ПРОЧЕЕ
+    Сначала по содержимому, при ПРОЧЕЕ — фолбэк по имени файла.
     """
     sample = text[:6000].lower()
 
@@ -68,7 +81,18 @@ def classify(text: str) -> str:
         scores[doc_type] = sum(1 for s in signals if s in sample)
 
     best_type, best_score = max(scores.items(), key=lambda x: x[1])
-    return best_type if best_score > 0 else "ПРОЧЕЕ"
+    if best_score > 0:
+        return best_type
+
+    # Фолбэк: классификация по имени файла
+    if filename:
+        name_lower = filename.lower()
+        for doc_type, signals in FILENAME_SIGNALS.items():
+            for signal in signals:
+                if signal in name_lower:
+                    return doc_type
+
+    return "ПРОЧЕЕ"
 
 
 # Приоритет типов при сборке контекста (чем меньше — тем важнее)
