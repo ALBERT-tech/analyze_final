@@ -121,6 +121,30 @@ def _try_parse_json(content: str, task_id: str) -> list | None:
     return None
 
 
+def _format_results_text(results: list, meta: dict) -> str:
+    """Форматирует результаты в читаемый текст для Битрикс."""
+    lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
+
+    files = meta.get("files", [])
+    if files:
+        names = ", ".join(f["name"] for f in files)
+        lines.append(f"Файлы: {names}")
+        lines.append("")
+
+    for i, item in enumerate(results, 1):
+        title = item.get("title", "")
+        answer = item.get("answer", "")
+        citation = item.get("citation", "")
+
+        lines.append(f"{i}. {title}")
+        lines.append(f"   {answer}")
+        if citation and citation != "—":
+            lines.append(f"   [{citation}]")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
 def load_default_prompt() -> str:
     if DEFAULT_PROMPT_PATH.exists():
         return DEFAULT_PROMPT_PATH.read_text(encoding="utf-8")
@@ -272,13 +296,13 @@ async def process_task(task_id: str, saved_paths: list[Path], prompt_template: s
             "context_chars": context_chars,
             "truncated": truncated,
         }
-        task.update(status="done", results=parsed, meta=meta)
+        text_report = _format_results_text(parsed, meta)
+        task.update(status="done", results=parsed, meta=meta, text=text_report)
 
         # -- Callback (для Битрикса и др.) --
         callback_url = task.get("callback_url")
         if callback_url:
             try:
-                text_report = format_results_text(parsed)
                 async with httpx.AsyncClient(timeout=30.0) as cb_client:
                     await cb_client.post(callback_url, json={
                         "task_id": task_id,
@@ -395,6 +419,7 @@ async def get_status(task_id: str):
         return JSONResponse({
             "status": "done",
             "results": task.get("results"),
+            "text": task.get("text"),
             "meta": task.get("meta"),
         })
     elif task["status"] == "error":
