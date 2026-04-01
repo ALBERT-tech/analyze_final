@@ -576,11 +576,16 @@ async def analyze(
     cleanup_old_tasks()
 
     # Определяем: кастомный промпт или стандартный pipeline
+    # Если промпт пустой или совпадает с дефолтным — новый 4-параллельный путь
     custom_prompt = None
+    default_prompt = load_default_prompt()
     if prompt and prompt.strip():
-        custom_prompt = prompt.strip()
-        if "{{CONTRACT_TEXT}}" not in custom_prompt:
+        p = prompt.strip()
+        if "{{CONTRACT_TEXT}}" not in p:
             raise HTTPException(status_code=400, detail="В промпте отсутствует метка {{CONTRACT_TEXT}}")
+        # Сравниваем с дефолтным (без учёта пробелов)
+        if p.replace("\r\n", "\n").strip() != default_prompt.replace("\r\n", "\n").strip():
+            custom_prompt = p
 
     # Сохраняем файлы
     tmp_dir = Path(tempfile.mkdtemp())
@@ -650,10 +655,13 @@ async def api_analyze(req: ApiAnalyzeRequest):
     cleanup_old_tasks()
 
     custom_prompt = None
+    default_prompt = load_default_prompt()
     if req.prompt and req.prompt.strip():
-        custom_prompt = req.prompt.strip()
-        if "{{CONTRACT_TEXT}}" not in custom_prompt:
+        p = req.prompt.strip()
+        if "{{CONTRACT_TEXT}}" not in p:
             raise HTTPException(status_code=400, detail="В промпте отсутствует метка {{CONTRACT_TEXT}}")
+        if p.replace("\r\n", "\n").strip() != default_prompt.replace("\r\n", "\n").strip():
+            custom_prompt = p
 
     # Скачиваем файлы
     tmp_dir = Path(tempfile.mkdtemp())
