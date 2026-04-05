@@ -173,7 +173,7 @@ footer a { color:var(--primary); text-decoration:none; }
       <div class="step pending" id="s2">Извлечение текста из документов</div>
       <div class="step pending" id="s3">Классификация и нарезка на разделы</div>
       <div class="step pending" id="s4">Маршрутизация и сборка контекста</div>
-      <div class="step pending" id="s5">Запросы к DeepSeek (4 параллельных)</div>
+      <div class="step pending" id="s5">Запросы к модели (2 параллельных)</div>
       <div class="step pending" id="s6">Формирование отчёта</div>
     </div>
   </div>
@@ -482,17 +482,7 @@ function renderBlock(container, title, items, color) {
   hdr.textContent = title;
   container.appendChild(hdr);
 
-  let currentSource = null;
   items.forEach(item => {
-    const source = item.source || '';
-    if (source && source !== currentSource) {
-      currentSource = source;
-      const srcHdr = document.createElement('div');
-      srcHdr.style.cssText = 'font-weight:500;font-size:13px;margin:14px 0 6px;padding:4px 12px;color:var(--text-secondary);text-transform:uppercase;letter-spacing:0.5px;';
-      srcHdr.textContent = source;
-      container.appendChild(srcHdr);
-    }
-
     const card = document.createElement('div');
     card.className = 'result-card';
     const notFound = !item.answer || item.answer.toLowerCase().includes('не найден');
@@ -502,7 +492,19 @@ function renderBlock(container, title, items, color) {
     } else {
       html += `<div class="result-answer">${esc(item.answer || '')}</div>`;
     }
-    if (item.citation && item.citation.trim().length > 5 && !item.citation.toLowerCase().includes('не найден')) {
+    // Новый формат: sources[]
+    if (item.sources && item.sources.length) {
+      item.sources.forEach(src => {
+        const doc = src.doc || '';
+        const ref = src.ref || '';
+        const cit = src.citation || '';
+        if (cit) {
+          html += `<div class="citation"><b>${esc(doc)}, ${esc(ref)}</b> — ${esc(cit)}</div>`;
+        }
+      });
+    }
+    // Старый формат: citation
+    else if (item.citation && item.citation.trim().length > 5 && !item.citation.toLowerCase().includes('не найден')) {
       html += `<div class="citation">${esc(item.citation)}</div>`;
     }
     card.innerHTML = html;
