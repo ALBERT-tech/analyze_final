@@ -48,6 +48,7 @@ MAX_CONTEXT_CHARS   = int(os.getenv("MAX_CONTEXT_CHARS", "500000"))
 DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
 RISKS_PROMPT_PATH   = Path("prompts/risks.txt")
 PARAMS_PROMPT_PATH  = Path("prompts/params.txt")
+SHORT_PROMPT_PATH   = Path("prompts/short.txt")
 
 # -- Хранилище задач -------------------------------------------------------
 tasks: dict[str, dict] = {}
@@ -401,6 +402,73 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
 
 # -- Legacy pipeline (кастомный промпт) ------------------------------------
 
+async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Path):
+    """Pipeline short: один запрос, 7 вопросов, обычный отчёт."""
+    try:
+        task = tasks[task_id]
+
+        task.update(status="processing", step="extracting", detail="Извлечение текста...")
+        extracted = await asyncio.to_thread(extract_files, saved_paths)
+        valid = [f for f in extracted if not f.skipped and f.text.strip()]
+
+        if not valid:
+            task.update(status="error", detail="Нет пригодных файлов.")
+            return
+
+        task.update(step="classifying", detail="Обработка документов...")
+        docs = []
+        for f in valid:
+            doc_type = classify(f.text, f.name)
+            sections = split_into_sections(f.text)
+            docs.append({"name": f.name, "type": doc_type,
+                         "sections": sections, "char_count": len(f.text)})
+            logger.info(f"[TASK {task_id[:8]}] {f.name}: {doc_type}, {len(f.text)} симв.")
+
+        task.update(step="context", detail="Сборка контекста...")
+        context, context_chars = build_full_context(docs, MAX_CONTEXT_CHARS)
+        if not context:
+            task.update(status="error", detail="Пустой контекст")
+            return
+
+        logger.info(f"[TASK {task_id[:8]}] Контекст: {context_chars} симв.")
+
+        task.update(step="api", detail="Запрос к модели...")
+        short_prompt = load_prompt(SHORT_PROMPT_PATH).replace("{{CONTRACT_TEXT}}", context)
+        parsed = await call_api(short_prompt, task_id, "SHORT")
+
+        if not parsed:
+            task.update(status="error", detail="Модель не ответила. Попробуйте ещё раз.")
+            return
+
+        task.update(step="parsing", detail="Формирование отчёта...")
+
+        meta = {"files": [{"name": d["name"], "type": d["type"], "chars": d["char_count"]} for d in docs],
+                "skipped": [{"name": f.name, "reason": f.skip_reason} for f in extracted if f.skipped],
+                "context_chars": context_chars}
+
+        text_report = format_report([], parsed, [], meta)
+        task.update(status="done", results=parsed, parameters=parsed, risks=[],
+                    warnings=[], meta=meta, text=text_report)
+
+        callback_url = task.get("callback_url")
+        if callback_url:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as cb:
+                    await cb.post(callback_url, json={
+                        "task_id": task_id, "status": "done",
+                        "results": parsed, "text": text_report, "meta": meta,
+                    })
+                logger.info(f"[TASK {task_id[:8]}] Callback отправлен")
+            except Exception as cb_err:
+                logger.error(f"[TASK {task_id[:8]}] Ошибка callback: {cb_err}")
+
+    except Exception as e:
+        logger.error(f"[TASK {task_id[:8]}] Ошибка: {e}", exc_info=True)
+        tasks[task_id].update(status="error", detail=str(e)[:200])
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 async def process_task_legacy(task_id: str, saved_paths: list[Path], prompt_template: str, tmp_dir: Path):
     """Старый pipeline: один запрос с кастомным промптом."""
     try:
@@ -461,6 +529,7 @@ class ApiAnalyzeRequest(BaseModel):
     files: list[str]
     callback_url: str | None = None
     prompt: str | None = None
+    mode: str = "full"  # "short" или "full"
 
 
 # -- Эндпоинты ------------------------------------------------------------
@@ -495,6 +564,7 @@ async def get_default_prompt():
 async def analyze(
     files: list[UploadFile] = File(...),
     prompt: str = Form(None),
+    mode: str = Form("full"),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="Файлы не переданы")
@@ -530,9 +600,12 @@ async def analyze(
     if custom_prompt:
         asyncio.create_task(process_task_legacy(task_id, saved_paths, custom_prompt, tmp_dir))
         logger.info(f"[TASK {task_id[:8]}] LEGACY, файлов: {len(saved_paths)}")
+    elif mode == "short":
+        asyncio.create_task(process_task_short(task_id, saved_paths, tmp_dir))
+        logger.info(f"[TASK {task_id[:8]}] SHORT, файлов: {len(saved_paths)}")
     else:
         asyncio.create_task(process_task_v3(task_id, saved_paths, tmp_dir))
-        logger.info(f"[TASK {task_id[:8]}] v3 (2-PARALLEL), файлов: {len(saved_paths)}")
+        logger.info(f"[TASK {task_id[:8]}] FULL (2-PARALLEL), файлов: {len(saved_paths)}")
 
     return JSONResponse({"task_id": task_id})
 
@@ -616,10 +689,12 @@ async def api_analyze(req: ApiAnalyzeRequest):
 
     if custom_prompt:
         asyncio.create_task(process_task_legacy(task_id, saved_paths, custom_prompt, tmp_dir))
+    elif req.mode == "short":
+        asyncio.create_task(process_task_short(task_id, saved_paths, tmp_dir))
     else:
         asyncio.create_task(process_task_v3(task_id, saved_paths, tmp_dir))
 
-    logger.info(f"[API TASK {task_id[:8]}] файлов: {len(saved_paths)}, callback: {req.callback_url or 'нет'}")
+    logger.info(f"[API TASK {task_id[:8]}] mode={req.mode}, файлов: {len(saved_paths)}, callback: {req.callback_url or 'нет'}")
 
     return JSONResponse({
         "task_id": task_id, "status": "processing",

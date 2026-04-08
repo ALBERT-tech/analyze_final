@@ -162,6 +162,16 @@ footer a { color:var(--primary); text-decoration:none; }
 
   <div class="error-box" id="errorBox"></div>
 
+  <div style="display:flex;gap:16px;align-items:center;margin-bottom:12px;">
+    <label style="font-size:14px;font-weight:500;color:var(--text);">Режим:</label>
+    <label style="font-size:13px;cursor:pointer;display:flex;align-items:center;gap:4px;">
+      <input type="radio" name="mode" value="short" checked> Обычный (7 вопросов)
+    </label>
+    <label style="font-size:13px;cursor:pointer;display:flex;align-items:center;gap:4px;">
+      <input type="radio" name="mode" value="full"> Расширенный (18 вопросов)
+    </label>
+  </div>
+
   <div class="btn-row">
     <button class="btn-primary" id="analyzeBtn" disabled>Анализировать</button>
     <button class="btn-secondary" id="clearBtn">Очистить</button>
@@ -334,6 +344,8 @@ async function runAnalysis() {
     const formData = new FormData();
     uploadedFiles.forEach(f => formData.append('files', f));
     formData.append('prompt', document.getElementById('promptEditor').value);
+    const mode = document.querySelector('input[name="mode"]:checked')?.value || 'full';
+    formData.append('mode', mode);
 
     const submitResp = await fetch('/analyze', { method: 'POST', body: formData });
     if (!submitResp.ok) {
