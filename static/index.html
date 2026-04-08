@@ -140,17 +140,8 @@ footer a { color:var(--primary); text-decoration:none; }
   <div class="file-list" id="fileList"></div>
 </div>
 
-<!-- ПРОМПТ -->
-<div class="card">
-  <details id="promptDetails">
-    <summary>Вопросы к документу (промпт)</summary>
-    <p class="prompt-hint">Редактируйте вопросы под ваш тендер. Не удаляйте метку <code>{{CONTRACT_TEXT}}</code>.</p>
-    <textarea id="promptEditor" spellcheck="false"></textarea>
-    <div style="display:flex;justify-content:flex-end;margin-top:8px;">
-      <button class="btn-secondary btn-sm" id="resetPromptBtn">↺ Сбросить</button>
-    </div>
-  </details>
-</div>
+<!-- Скрытый промпт для legacy -->
+<textarea id="promptEditor" style="display:none"></textarea>
 
 <!-- УПРАВЛЕНИЕ -->
 <div class="card">
@@ -222,9 +213,6 @@ defaultPrompt = `__DEFAULT_PROMPT__`;
 document.getElementById('promptEditor').value = defaultPrompt;
 console.log('[PROMPT] Промпт загружен:', defaultPrompt.length, 'симв.');
 
-document.getElementById('resetPromptBtn').addEventListener('click', () => {
-  document.getElementById('promptEditor').value = defaultPrompt;
-});
 
 // ── Dropzone ──────────────────────────────────────────────
 const dropzone = document.getElementById('dropzone');
@@ -291,15 +279,15 @@ function allSteps(state) {
 
 // ── Метр контекста ────────────────────────────────────────
 function updateMeter(chars, truncated) {
-  const MAX = 100000;
+  const MODEL_LIMIT = 1000000; // Gemini Flash: 1M токенов
   const mw = document.getElementById('meterWrap');
   mw.style.display = 'block';
-  const pct = Math.min(100, Math.round(chars / MAX * 100));
+  const tokensIn = Math.round(chars / 4);
+  const pct = Math.min(100, Math.round(tokensIn / MODEL_LIMIT * 100));
   const fill = document.getElementById('meterFill');
-  fill.style.width = pct + '%';
+  fill.style.width = Math.max(pct, 1) + '%';
   fill.className = 'meter-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warn' : '');
-  const tokens = Math.round(chars / 4).toLocaleString('ru');
-  document.getElementById('meterText').textContent = `${chars.toLocaleString('ru')} симв. · ~${tokens} токенов (${pct}%)`;
+  document.getElementById('meterText').textContent = `~${tokensIn.toLocaleString('ru')} токенов на вход · лимит модели: 1M`;
   document.getElementById('truncateNote').style.display = truncated ? 'block' : 'none';
 }
 
