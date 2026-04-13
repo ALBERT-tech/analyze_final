@@ -819,11 +819,34 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+# Rate limiting: IP → [timestamps]
+login_attempts: dict[str, list[float]] = {}
+LOGIN_RATE_LIMIT = 5  # попыток
+LOGIN_RATE_WINDOW = 60  # секунд
+
+
 @app.post("/auth/login")
-async def auth_login(req: LoginRequest):
+async def auth_login(req: LoginRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+
+    # Rate limiting
+    now = time.time()
+    attempts = login_attempts.get(ip, [])
+    attempts = [t for t in attempts if now - t < LOGIN_RATE_WINDOW]
+    if len(attempts) >= LOGIN_RATE_LIMIT:
+        logger.warning(f"[AUTH] Rate limit: {ip} ({req.login})")
+        return JSONResponse({"ok": False, "detail": "Слишком много попыток. Подождите минуту."}, status_code=429)
+
     user = auth_module.authenticate(req.login, req.password)
     if not user:
+        attempts.append(now)
+        login_attempts[ip] = attempts
+        logger.warning(f"[AUTH] Неудачный вход: login={req.login}, ip={ip}")
         return JSONResponse({"ok": False, "detail": "Неверный логин или пароль"}, status_code=401)
+
+    # Успешный вход — сбрасываем счётчик
+    login_attempts.pop(ip, None)
+    logger.info(f"[AUTH] Вход: login={req.login}, ip={ip}")
 
     session_token = str(uuid.uuid4())
     sessions[session_token] = user["id"]
