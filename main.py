@@ -22,9 +22,10 @@ import uuid
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Response, Cookie
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
@@ -32,6 +33,7 @@ import os
 from pipeline.extractor import extract_files
 from pipeline.classifier import classify
 from pipeline.splitter import split_into_sections
+import auth as auth_module
 
 load_dotenv()
 
@@ -46,6 +48,10 @@ MAX_TOKENS_PER_CALL = int(os.getenv("MAX_TOKENS_PER_CALL", "12000"))
 MAX_CONTEXT_CHARS   = int(os.getenv("MAX_CONTEXT_CHARS", "500000"))
 
 DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
+SESSION_SECRET      = os.getenv("SESSION_SECRET", "tender-analyzer-secret-key-change-me")
+
+# -- Сессии (cookie → user_id) ---------------------------------------------
+sessions: dict[str, int] = {}  # session_token → user_id
 RISKS_PROMPT_PATH   = Path("prompts/risks.txt")
 PARAMS_PROMPT_PATH  = Path("prompts/params.txt")
 SHORT_PROMPT_PATH   = Path("prompts/short.txt")
@@ -69,6 +75,52 @@ def cleanup_old_tasks():
 
 # -- FastAPI ---------------------------------------------------------------
 app = FastAPI(title="Анализатор тендерной документации v3")
+
+# Инициализация БД
+auth_module.init_db()
+
+# Пути без авторизации
+PUBLIC_PATHS = {"/auth/login", "/health", "/openapi.json", "/docs", "/favicon.ico"}
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # Публичные пути
+        if path in PUBLIC_PATHS or path.startswith("/static/"):
+            return await call_next(request)
+
+        # Страница логина
+        if path == "/login":
+            return await call_next(request)
+
+        # API-доступ через X-API-Key
+        api_key = request.headers.get("X-API-Key")
+        if api_key:
+            user = auth_module.get_user_by_api_key(api_key)
+            if not user:
+                return JSONResponse({"detail": "Неверный API-ключ"}, status_code=401)
+            request.state.user = user
+            return await call_next(request)
+
+        # Веб-доступ через cookie
+        session_token = request.cookies.get("session")
+        if session_token and session_token in sessions:
+            user_id = sessions[session_token]
+            user = auth_module.get_user_by_id(user_id)
+            if user and user["active"]:
+                request.state.user = user
+                return await call_next(request)
+
+        # Не авторизован → редирект на логин (для веб) или 401 (для API)
+        if path.startswith("/api/") or path.startswith("/analyze") or path.startswith("/status/"):
+            return JSONResponse({"detail": "Требуется авторизация"}, status_code=401)
+
+        return RedirectResponse("/login", status_code=302)
+
+
+app.add_middleware(AuthMiddleware)
 
 
 # -- Утилиты ---------------------------------------------------------------
@@ -363,6 +415,13 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             text=text_report,
         )
 
+        # Логирование usage
+        uid = task.get("user_id", 0)
+        if uid:
+            tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in flat_results)
+            auth_module.log_usage(uid, "full", task.get("files_count", 0),
+                                 context_chars // 4, tokens_out, "done")
+
         # -- Callback --
         callback_url = task.get("callback_url")
         if callback_url:
@@ -449,6 +508,13 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         text_report = format_report([], parsed, [], meta)
         task.update(status="done", results=parsed, parameters=parsed, risks=[],
                     warnings=[], meta=meta, text=text_report)
+
+        # Логирование usage
+        uid = task.get("user_id", 0)
+        if uid:
+            tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in parsed)
+            auth_module.log_usage(uid, "short", task.get("files_count", 0),
+                                 context_chars // 4, tokens_out, "done")
 
         callback_url = task.get("callback_url")
         if callback_url:
@@ -562,6 +628,7 @@ async def get_default_prompt():
 
 @app.post("/analyze")
 async def analyze(
+    request: Request,
     files: list[UploadFile] = File(...),
     prompt: str = Form(None),
     mode: str = Form("full"),
@@ -570,6 +637,14 @@ async def analyze(
         raise HTTPException(status_code=400, detail="Файлы не переданы")
 
     cleanup_old_tasks()
+
+    # Проверка лимита
+    user = getattr(request.state, "user", None)
+    user_id = user["id"] if user else 0
+    if user_id:
+        allowed, used, limit = auth_module.check_daily_limit(user_id)
+        if not allowed:
+            raise HTTPException(status_code=429, detail=f"Дневной лимит исчерпан ({used}/{limit} токенов)")
 
     # Кастомный промпт?
     custom_prompt = None
@@ -595,6 +670,7 @@ async def analyze(
     tasks[task_id] = {
         "status": "processing", "step": "uploading",
         "detail": "Файлы загружены...", "created": time.time(), "tmp_dir": str(tmp_dir),
+        "user_id": user_id, "mode": mode, "files_count": len(saved_paths),
     }
 
     if custom_prompt:
@@ -640,11 +716,18 @@ async def get_status(task_id: str):
 
 
 @app.post("/api/analyze")
-async def api_analyze(req: ApiAnalyzeRequest):
+async def api_analyze(req: ApiAnalyzeRequest, request: Request):
     if not req.files:
         raise HTTPException(status_code=400, detail="Список файлов пуст")
 
     cleanup_old_tasks()
+
+    user = getattr(request.state, "user", None)
+    user_id = user["id"] if user else 0
+    if user_id:
+        allowed, used, limit = auth_module.check_daily_limit(user_id)
+        if not allowed:
+            raise HTTPException(status_code=429, detail=f"Дневной лимит исчерпан ({used}/{limit} токенов)")
 
     custom_prompt = None
     default = load_default_prompt()
@@ -685,6 +768,7 @@ async def api_analyze(req: ApiAnalyzeRequest):
         "status": "processing", "step": "uploading",
         "detail": "Файлы скачаны...", "created": time.time(),
         "tmp_dir": str(tmp_dir), "callback_url": req.callback_url,
+        "user_id": user_id, "mode": req.mode, "files_count": len(saved_paths),
     }
 
     if custom_prompt:
@@ -701,6 +785,140 @@ async def api_analyze(req: ApiAnalyzeRequest):
         "message": f"Принято {len(saved_paths)} файлов. " +
                    ("Результат на callback." if req.callback_url else f"GET /status/{task_id}"),
     })
+
+
+# -- Страницы авторизации --------------------------------------------------
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    return HTMLResponse(Path("static/login.html").read_text(encoding="utf-8"))
+
+
+@app.get("/profile", response_class=HTMLResponse)
+async def profile_page():
+    return HTMLResponse(Path("static/profile.html").read_text(encoding="utf-8"))
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        return RedirectResponse("/", status_code=302)
+    return HTMLResponse(Path("static/admin.html").read_text(encoding="utf-8"))
+
+
+# -- Auth API --------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    login: str
+    password: str
+
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str
+
+
+@app.post("/auth/login")
+async def auth_login(req: LoginRequest):
+    user = auth_module.authenticate(req.login, req.password)
+    if not user:
+        return JSONResponse({"ok": False, "detail": "Неверный логин или пароль"}, status_code=401)
+
+    session_token = str(uuid.uuid4())
+    sessions[session_token] = user["id"]
+
+    response = JSONResponse({"ok": True})
+    response.set_cookie("session", session_token, httponly=True, max_age=86400 * 7)
+    return response
+
+
+@app.get("/auth/logout")
+async def auth_logout(request: Request):
+    session_token = request.cookies.get("session")
+    if session_token and session_token in sessions:
+        del sessions[session_token]
+    response = RedirectResponse("/login", status_code=302)
+    response.delete_cookie("session")
+    return response
+
+
+@app.post("/auth/change_password")
+async def auth_change_password(req: ChangePasswordRequest, request: Request):
+    user = getattr(request.state, "user", None)
+    if not user:
+        return JSONResponse({"ok": False, "detail": "Не авторизован"}, status_code=401)
+
+    # Проверяем старый пароль
+    check = auth_module.authenticate(user["login"], req.old_password)
+    if not check:
+        return JSONResponse({"ok": False, "detail": "Неверный текущий пароль"})
+
+    auth_module.change_password(user["id"], req.new_password)
+    return JSONResponse({"ok": True})
+
+
+# -- Admin API -------------------------------------------------------------
+
+class AddUserRequest(BaseModel):
+    login: str
+    password: str
+    role: str = "user"
+    daily_token_limit: int = 0
+
+
+class ResetPasswordRequest(BaseModel):
+    password: str
+
+
+@app.get("/admin/api/users")
+async def admin_get_users(request: Request):
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    return JSONResponse(auth_module.get_user_stats())
+
+
+@app.get("/admin/api/user_log/{user_id}")
+async def admin_get_user_log(user_id: int, request: Request):
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    return JSONResponse(auth_module.get_user_log(user_id))
+
+
+@app.post("/admin/api/add_user")
+async def admin_add_user(req: AddUserRequest, request: Request):
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    try:
+        new_user = auth_module.create_user(login=req.login, password=req.password,
+                                           role=req.role, daily_limit=req.daily_token_limit)
+        return JSONResponse({"ok": True, "api_key": new_user["api_key"]})
+    except Exception as e:
+        return JSONResponse({"ok": False, "detail": str(e)}, status_code=400)
+
+
+@app.post("/admin/api/toggle_user/{user_id}")
+async def admin_toggle_user(user_id: int, request: Request):
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    target = auth_module.get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404)
+    auth_module.update_user(user_id, active=0 if target["active"] else 1)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/admin/api/reset_password/{user_id}")
+async def admin_reset_password(user_id: int, req: ResetPasswordRequest, request: Request):
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    auth_module.change_password(user_id, req.password)
+    return JSONResponse({"ok": True})
 
 
 # Статика ПОСЛЕ роутов

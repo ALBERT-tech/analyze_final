@@ -18,6 +18,9 @@ COPY . .
 # Проверяем что pipeline пакет на месте
 RUN python -c "from pipeline.classifier import classify; print('pipeline OK')"
 
+# Папка для SQLite БД (монтируется как volume)
+RUN mkdir -p /app/data
+
 EXPOSE 8000
 
 CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}

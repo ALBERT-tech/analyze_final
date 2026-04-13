@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Админка — Анализатор</title>
+<style>
+:root { --primary: #208C8D; --bg: #FCFCF9; --surface: #FFFFFF; --text: #134252; --text2: #626C7C; --border: #E0E0E0; --error: #C0152F; --green: #2e7d32; --radius: 8px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
+.container { max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 22px; margin-bottom: 8px; }
+.subtitle { color: var(--text2); font-size: 13px; margin-bottom: 24px; }
+.nav { display: flex; gap: 16px; margin-bottom: 24px; }
+.nav a { color: var(--primary); text-decoration: none; font-size: 14px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 8px 10px; border-bottom: 2px solid var(--border); color: var(--text2); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+td { padding: 8px 10px; border-bottom: 1px solid #f0f0f0; }
+tr:hover { background: #f8f8f6; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+.b-active { background: #e8f5e9; color: var(--green); }
+.b-blocked { background: #fce8e8; color: var(--error); }
+.b-admin { background: #e0f4f4; color: var(--primary); }
+.b-user { background: #f2f2f0; color: var(--text2); }
+button, .btn { padding: 5px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); cursor: pointer; font-size: 12px; color: var(--text); }
+button:hover, .btn:hover { background: #f5f5f5; }
+.btn-primary { background: var(--primary); color: white; border-color: var(--primary); }
+.btn-danger { color: var(--error); border-color: var(--error); }
+.modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.3); z-index: 100; justify-content: center; align-items: center; }
+.modal { background: var(--surface); border-radius: var(--radius); padding: 24px; width: 400px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); }
+.modal h2 { font-size: 16px; margin-bottom: 16px; }
+.modal label { font-size: 13px; font-weight: 500; display: block; margin-bottom: 4px; }
+.modal input, .modal select { width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; margin-bottom: 12px; }
+.modal .btn-row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; }
+.token-num { font-family: monospace; }
+.detail-row { display: none; }
+.detail-row td { padding: 12px; background: #fafaf8; }
+.detail-table { width: 100%; font-size: 12px; }
+.detail-table th { font-size: 10px; border-bottom: 1px solid var(--border); }
+.detail-table td { border-bottom: 1px solid #f0f0f0; padding: 4px 8px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="nav">
+  <a href="/">Анализатор</a>
+  <a href="/profile">Сменить пароль</a>
+  <a href="/auth/logout">Выйти</a>
+</div>
+
+<h1>Панель администратора</h1>
+<p class="subtitle">Управление пользователями и статистика</p>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+    <strong>Пользователи</strong>
+    <button class="btn-primary" onclick="showAddModal()">+ Добавить</button>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Логин</th>
+        <th>Роль</th>
+        <th>Статус</th>
+        <th>Лимит/день</th>
+        <th>Сегодня</th>
+        <th>Неделя</th>
+        <th>Всего</th>
+        <th>Запросов</th>
+        <th>API-ключ</th>
+        <th>Действия</th>
+      </tr>
+    </thead>
+    <tbody id="usersTable"></tbody>
+  </table>
+</div>
+
+</div>
+
+<!-- Модалка добавления -->
+<div class="modal-overlay" id="addModal">
+  <div class="modal">
+    <h2>Новый пользователь</h2>
+    <label>Логин</label>
+    <input type="text" id="newLogin">
+    <label>Пароль</label>
+    <input type="password" id="newPassword">
+    <label>Роль</label>
+    <select id="newRole"><option value="user">user</option><option value="admin">admin</option></select>
+    <label>Лимит токенов/день (0 = безлимит)</label>
+    <input type="number" id="newLimit" value="0">
+    <div class="btn-row">
+      <button onclick="hideAddModal()">Отмена</button>
+      <button class="btn-primary" onclick="addUser()">Создать</button>
+    </div>
+  </div>
+</div>
+
+<!-- Модалка сброса пароля -->
+<div class="modal-overlay" id="resetModal">
+  <div class="modal">
+    <h2>Сброс пароля: <span id="resetLogin"></span></h2>
+    <label>Новый пароль</label>
+    <input type="password" id="resetPassword">
+    <div class="btn-row">
+      <button onclick="hideResetModal()">Отмена</button>
+      <button class="btn-primary" onclick="doResetPassword()">Сбросить</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let currentResetId = null;
+
+function fmt(n) {
+  if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n/1000).toFixed(1) + 'K';
+  return n.toString();
+}
+
+async function loadUsers() {
+  const r = await fetch('/admin/api/users');
+  const users = await r.json();
+  const tbody = document.getElementById('usersTable');
+  tbody.innerHTML = '';
+
+  users.forEach(u => {
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'pointer';
+    tr.innerHTML = `
+      <td><strong>${u.login}</strong></td>
+      <td><span class="badge b-${u.role}">${u.role}</span></td>
+      <td><span class="badge ${u.active ? 'b-active' : 'b-blocked'}">${u.active ? 'активен' : 'заблокирован'}</span></td>
+      <td class="token-num">${u.daily_token_limit === 0 ? 'безлимит' : fmt(u.daily_token_limit)}</td>
+      <td class="token-num">${fmt(u.today_tokens)}</td>
+      <td class="token-num">${fmt(u.week_tokens)}</td>
+      <td class="token-num">${fmt(u.total_tokens)}</td>
+      <td>${u.total_requests}</td>
+      <td style="font-family:monospace;font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;" title="${u.api_key}">${u.api_key.substring(0,8)}...</td>
+      <td>
+        <button onclick="event.stopPropagation();toggleUser(${u.id},${u.active})" class="${u.active ? 'btn-danger' : ''}" style="margin-right:4px;">${u.active ? 'Блок' : 'Разблок'}</button>
+        <button onclick="event.stopPropagation();showResetModal(${u.id},'${u.login}')">Пароль</button>
+      </td>`;
+    tr.addEventListener('click', () => toggleDetail(u.id));
+    tbody.appendChild(tr);
+
+    // Строка с деталями
+    const detailTr = document.createElement('tr');
+    detailTr.className = 'detail-row';
+    detailTr.id = 'detail-' + u.id;
+    detailTr.innerHTML = '<td colspan="10"><div id="detail-content-' + u.id + '">Загрузка...</div></td>';
+    tbody.appendChild(detailTr);
+  });
+}
+
+async function toggleDetail(userId) {
+  const row = document.getElementById('detail-' + userId);
+  if (row.style.display === 'table-row') {
+    row.style.display = 'none';
+    return;
+  }
+  row.style.display = 'table-row';
+
+  const r = await fetch('/admin/api/user_log/' + userId);
+  const logs = await r.json();
+  const div = document.getElementById('detail-content-' + userId);
+
+  if (!logs.length) {
+    div.innerHTML = '<em style="color:var(--text2)">Нет запросов</em>';
+    return;
+  }
+
+  let html = '<table class="detail-table"><thead><tr><th>Дата</th><th>Режим</th><th>Файлов</th><th>Токенов вход</th><th>Токенов выход</th><th>Статус</th></tr></thead><tbody>';
+  logs.forEach(l => {
+    const d = new Date(l.timestamp);
+    const ds = d.toLocaleDateString('ru') + ' ' + d.toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit'});
+    html += `<tr><td>${ds}</td><td>${l.mode||'-'}</td><td>${l.files_count}</td><td class="token-num">${fmt(l.tokens_in)}</td><td class="token-num">${fmt(l.tokens_out)}</td><td>${l.status}</td></tr>`;
+  });
+  html += '</tbody></table>';
+  div.innerHTML = html;
+}
+
+async function toggleUser(id, currentActive) {
+  await fetch('/admin/api/toggle_user/' + id, {method:'POST'});
+  loadUsers();
+}
+
+function showAddModal() { document.getElementById('addModal').style.display = 'flex'; }
+function hideAddModal() { document.getElementById('addModal').style.display = 'none'; }
+
+async function addUser() {
+  const login = document.getElementById('newLogin').value;
+  const password = document.getElementById('newPassword').value;
+  const role = document.getElementById('newRole').value;
+  const limit = parseInt(document.getElementById('newLimit').value) || 0;
+
+  if (!login || !password) { alert('Заполните логин и пароль'); return; }
+
+  const r = await fetch('/admin/api/add_user', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({login, password, role, daily_token_limit: limit}),
+  });
+  const d = await r.json();
+  if (d.ok) {
+    hideAddModal();
+    loadUsers();
+    alert('Пользователь создан. API-ключ: ' + d.api_key);
+  } else {
+    alert(d.detail || 'Ошибка');
+  }
+}
+
+function showResetModal(id, login) {
+  currentResetId = id;
+  document.getElementById('resetLogin').textContent = login;
+  document.getElementById('resetPassword').value = '';
+  document.getElementById('resetModal').style.display = 'flex';
+}
+function hideResetModal() { document.getElementById('resetModal').style.display = 'none'; }
+
+async function doResetPassword() {
+  const pw = document.getElementById('resetPassword').value;
+  if (!pw) { alert('Введите пароль'); return; }
+  await fetch('/admin/api/reset_password/' + currentResetId, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({password: pw}),
+  });
+  hideResetModal();
+  alert('Пароль сброшен');
+}
+
+loadUsers();
+</script>
+</body>
+</html>
