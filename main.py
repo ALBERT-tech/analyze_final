@@ -429,6 +429,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                 async with httpx.AsyncClient(timeout=30.0) as cb:
                     await cb.post(callback_url, json={
                         "task_id": task_id,
+                        "external_id": task.get("external_id"),
                         "status": "done",
                         "risks": risks_result,
                         "parameters": params_result,
@@ -450,7 +451,9 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             try:
                 async with httpx.AsyncClient(timeout=30.0) as cb:
                     await cb.post(callback_url, json={
-                        "task_id": task_id, "status": "error", "detail": str(e)[:200],
+                        "task_id": task_id,
+                        "external_id": tasks[task_id].get("external_id"),
+                        "status": "error", "detail": str(e)[:200],
                     })
             except Exception:
                 pass
@@ -521,7 +524,9 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
             try:
                 async with httpx.AsyncClient(timeout=30.0) as cb:
                     await cb.post(callback_url, json={
-                        "task_id": task_id, "status": "done",
+                        "task_id": task_id,
+                        "external_id": task.get("external_id"),
+                        "status": "done",
                         "results": parsed, "text": text_report, "meta": meta,
                     })
                 logger.info(f"[TASK {task_id[:8]}] Callback отправлен")
@@ -596,6 +601,7 @@ class ApiAnalyzeRequest(BaseModel):
     callback_url: str | None = None
     prompt: str | None = None
     mode: str = "full"  # "short" или "full"
+    external_id: str | None = None  # ID сделки Битрикс или другой внешний ID
 
 
 # -- Эндпоинты ------------------------------------------------------------
@@ -769,6 +775,7 @@ async def api_analyze(req: ApiAnalyzeRequest, request: Request):
         "detail": "Файлы скачаны...", "created": time.time(),
         "tmp_dir": str(tmp_dir), "callback_url": req.callback_url,
         "user_id": user_id, "mode": req.mode, "files_count": len(saved_paths),
+        "external_id": req.external_id,
     }
 
     if custom_prompt:
