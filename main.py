@@ -258,9 +258,20 @@ def format_report(risks: list, params: list, warnings: list, meta: dict) -> str:
     """Текстовый отчёт: Блок 1 (Риски) + Блок 2 (Параметры)."""
     lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
 
+    # Обработанные файлы
     files = meta.get("files", [])
     if files:
-        lines.append("Файлы: " + ", ".join(f'{f["name"]} ({f["type"]})' for f in files))
+        lines.append("Обработанные файлы:")
+        for f in files:
+            lines.append(f'  + {f["name"]} ({f["type"]}, {f["chars"]} симв.)')
+        lines.append("")
+
+    # Пропущенные файлы
+    skipped = meta.get("skipped", [])
+    if skipped:
+        lines.append("Не обработаны:")
+        for s in skipped:
+            lines.append(f'  - {s["name"]} — {s["reason"]}')
         lines.append("")
 
     if warnings:
@@ -312,6 +323,24 @@ def format_report(risks: list, params: list, warnings: list, meta: dict) -> str:
 
 # -- Основной pipeline (2 параллельных запроса) ----------------------------
 
+async def _send_error_callback(task_id: str, detail: str):
+    """Отправляет callback с ошибкой если callback_url задан."""
+    task = tasks.get(task_id, {})
+    callback_url = task.get("callback_url")
+    if callback_url:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as cb:
+                await cb.post(callback_url, json={
+                    "task_id": task_id,
+                    "external_id": task.get("external_id"),
+                    "status": "error",
+                    "detail": detail,
+                })
+            logger.info(f"[TASK {task_id[:8]}] Error callback отправлен")
+        except Exception as e:
+            logger.error(f"[TASK {task_id[:8]}] Ошибка error callback: {e}")
+
+
 async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
     """Pipeline v3: весь текст → 2 параллельных запроса (Риски + Параметры)."""
     try:
@@ -324,14 +353,18 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
         extracted = await asyncio.to_thread(extract_files, saved_paths)
 
         if not extracted:
-            task.update(status="error", detail="Не удалось извлечь текст ни из одного файла")
+            detail = "Не удалось извлечь текст ни из одного файла"
+            task.update(status="error", detail=detail)
+            await _send_error_callback(task_id, detail)
             return
 
         skipped = [{"name": f.name, "reason": f.skip_reason} for f in extracted if f.skipped]
         valid = [f for f in extracted if not f.skipped and f.text.strip()]
 
         if not valid:
-            task.update(status="error", detail="Нет пригодных для анализа файлов.")
+            detail = "Нет пригодных для анализа файлов."
+            task.update(status="error", detail=detail)
+            await _send_error_callback(task_id, detail)
             return
 
         logger.info(f"[TASK {task_id[:8]}] Извлечено: {len(valid)} файлов, пропущено: {len(skipped)}")
@@ -357,7 +390,9 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
         context, context_chars = build_full_context(docs, MAX_CONTEXT_CHARS)
 
         if not context:
-            task.update(status="error", detail="Не удалось сформировать контекст")
+            detail = "Не удалось сформировать контекст"
+            task.update(status="error", detail=detail)
+            await _send_error_callback(task_id, detail)
             return
 
         logger.info(f"[TASK {task_id[:8]}] Контекст: {context_chars} симв. (~{context_chars//4} токенов)")
@@ -370,6 +405,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             params_prompt = load_prompt(PARAMS_PROMPT_PATH).replace("{{CONTRACT_TEXT}}", context)
         except FileNotFoundError as e:
             task.update(status="error", detail=str(e))
+            await _send_error_callback(task_id, str(e))
             return
 
         risks_result, params_result = await asyncio.gather(
@@ -388,7 +424,9 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             params_result = []
 
         if not risks_result and not params_result:
-            task.update(status="error", detail="Модель не вернула ни одного ответа. Попробуйте ещё раз.")
+            detail = "Модель не вернула ни одного ответа. Попробуйте ещё раз."
+            task.update(status="error", detail=detail)
+            await _send_error_callback(task_id, detail)
             return
 
         # -- Шаг 5: Формирование отчёта --
