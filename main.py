@@ -650,13 +650,19 @@ async def health():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request):
     html_path = Path("static/index.html")
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="index.html не найден")
     html = html_path.read_text(encoding="utf-8")
     prompt = load_default_prompt().replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
     html = html.replace("__DEFAULT_PROMPT__", prompt)
+
+    # Роль пользователя — для показа/скрытия кнопки "Админка"
+    user = getattr(request.state, "user", None)
+    role = user["role"] if user else "user"
+    html = html.replace("__USER_ROLE__", role)
+
     return HTMLResponse(content=html)
 
 
