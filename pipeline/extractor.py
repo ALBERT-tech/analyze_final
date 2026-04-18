@@ -141,6 +141,17 @@ def _extract_txt(file_path: Path) -> str:
     return text
 
 
+def _extract_rtf(file_path: Path) -> str:
+    """RTF -> текст через striprtf."""
+    from striprtf.striprtf import rtf_to_text
+    logger.info(f"[RTF] striprtf -> {file_path.name}")
+    # RTF обычно в cp1251 или utf-8, striprtf сам разбирается
+    raw = file_path.read_text(encoding="utf-8", errors="replace")
+    text = rtf_to_text(raw, errors="ignore")
+    logger.info(f"[RTF] {len(text)} симв. из {file_path.name}")
+    return text
+
+
 def _extract_xlsx(file_path: Path) -> str:
     """XLSX -> текст через openpyxl."""
     import openpyxl
@@ -208,6 +219,7 @@ FORMAT_HANDLERS = {
     ".html": _extract_html,
     ".htm":  _extract_html,
     ".txt":  _extract_txt,
+    ".rtf":  _extract_rtf,
     ".xlsx": _extract_xlsx,
     ".xls":  _extract_xls,
     ".doc":  _extract_doc_antiword,
