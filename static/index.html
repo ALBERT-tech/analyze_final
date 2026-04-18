@@ -351,6 +351,7 @@ async function runAnalysis() {
     }
     const { task_id } = await submitResp.json();
     console.log('[POLL] Задача создана:', task_id);
+    currentTaskId = task_id;
 
     // 2. Поллим статус каждые 3 сек
     const data = await pollStatus(task_id);
@@ -492,33 +493,84 @@ function renderBlock(container, title, items, color) {
   container.appendChild(hdr);
 
   items.forEach(item => {
-    const card = document.createElement('div');
-    card.className = 'result-card';
-    const notFound = !item.answer || item.answer.toLowerCase().includes('не найден');
-    let html = `<div class="result-title">${esc(item.title || '')}</div>`;
-    if (notFound) {
-      html += `<div class="result-notfound">Информация не найдена в документации</div>`;
-    } else {
-      html += `<div class="result-answer">${esc(item.answer || '')}</div>`;
-    }
-    // Новый формат: sources[]
-    if (item.sources && item.sources.length) {
-      item.sources.forEach(src => {
-        const doc = src.doc || '';
-        const ref = src.ref || '';
-        const cit = src.citation || '';
-        if (cit) {
-          html += `<div class="citation"><b>${esc(doc)}, ${esc(ref)}</b> — ${esc(cit)}</div>`;
-        }
-      });
-    }
-    // Старый формат: citation
-    else if (item.citation && item.citation.trim().length > 5 && !item.citation.toLowerCase().includes('не найден')) {
-      html += `<div class="citation">${esc(item.citation)}</div>`;
-    }
-    card.innerHTML = html;
+    const card = renderCard(item);
     container.appendChild(card);
   });
+}
+
+function renderCard(item) {
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.innerHTML = buildCardHTML(item);
+  // Кнопка "Уточнить"
+  const refineBtn = card.querySelector('.refine-btn');
+  if (refineBtn) {
+    refineBtn.addEventListener('click', () => refineAnswer(card, item));
+  }
+  return card;
+}
+
+function buildCardHTML(item) {
+  const notFound = !item.answer || item.answer.toLowerCase().includes('не найден');
+  let html = `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+    <div class="result-title" style="flex:1;">${esc(item.title || '')}</div>
+    <button class="refine-btn" style="padding:4px 10px;font-size:11px;background:transparent;border:1px solid var(--border);border-radius:12px;color:var(--text-secondary);cursor:pointer;white-space:nowrap;">↻ Уточнить</button>
+  </div>`;
+  if (notFound) {
+    html += `<div class="result-notfound">Информация не найдена в документации</div>`;
+  } else {
+    html += `<div class="result-answer">${esc(item.answer || '')}</div>`;
+  }
+  if (item.sources && item.sources.length) {
+    item.sources.forEach(src => {
+      const doc = src.doc || '';
+      const ref = src.ref || '';
+      const cit = src.citation || '';
+      if (cit) {
+        html += `<div class="citation"><b>${esc(doc)}, ${esc(ref)}</b> — ${esc(cit)}</div>`;
+      }
+    });
+  } else if (item.citation && item.citation.trim().length > 5 && !item.citation.toLowerCase().includes('не найден')) {
+    html += `<div class="citation">${esc(item.citation)}</div>`;
+  }
+  return html;
+}
+
+let currentTaskId = null;
+
+async function refineAnswer(card, item) {
+  if (!currentTaskId) {
+    alert('Нет активной задачи для уточнения');
+    return;
+  }
+  const btn = card.querySelector('.refine-btn');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '...';
+
+  try {
+    const r = await fetch('/refine', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        task_id: currentTaskId,
+        question_title: item.title,
+        question_text: item.title,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'Ошибка уточнения');
+
+    // Заменяем содержимое карточки
+    Object.assign(item, d.item);
+    card.innerHTML = buildCardHTML(item);
+    const newBtn = card.querySelector('.refine-btn');
+    if (newBtn) newBtn.addEventListener('click', () => refineAnswer(card, item));
+  } catch(e) {
+    alert('Не удалось уточнить: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
 }
 
 // ── Сохранение TXT ────────────────────────────────────────

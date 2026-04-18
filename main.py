@@ -55,6 +55,7 @@ sessions: dict[str, int] = {}  # session_token → user_id
 RISKS_PROMPT_PATH   = Path("prompts/risks.txt")
 PARAMS_PROMPT_PATH  = Path("prompts/params.txt")
 SHORT_PROMPT_PATH   = Path("prompts/short.txt")
+REFINE_PROMPT_PATH  = Path("prompts/refine.txt")
 
 # -- Хранилище задач -------------------------------------------------------
 tasks: dict[str, dict] = {}
@@ -451,6 +452,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             warnings=warnings,
             meta=meta,
             text=text_report,
+            context=context,
         )
 
         # Логирование usage
@@ -548,7 +550,7 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
 
         text_report = format_report([], parsed, [], meta)
         task.update(status="done", results=parsed, parameters=parsed, risks=[],
-                    warnings=[], meta=meta, text=text_report)
+                    warnings=[], meta=meta, text=text_report, context=context)
 
         # Логирование usage
         uid = task.get("user_id", 0)
@@ -993,6 +995,56 @@ async def admin_reset_password(user_id: int, req: ResetPasswordRequest, request:
         raise HTTPException(status_code=403, detail="Доступ запрещён")
     auth_module.change_password(user_id, req.password)
     return JSONResponse({"ok": True})
+
+
+# -- Refine: уточнение ответа по одному вопросу ---------------------------
+
+class RefineRequest(BaseModel):
+    task_id: str
+    question_title: str  # "МЕСТО ПОСТАВКИ"
+    question_text: str | None = None  # полный текст вопроса (опционально)
+
+
+@app.post("/refine")
+async def refine(req: RefineRequest, request: Request):
+    """Переспросить модель по одному вопросу, используя сохранённый контекст."""
+    user = getattr(request.state, "user", None)
+    user_id = user["id"] if user else 0
+
+    if user_id:
+        allowed, used, limit = auth_module.check_daily_limit(user_id)
+        if not allowed:
+            raise HTTPException(status_code=429, detail=f"Дневной лимит исчерпан ({used}/{limit} токенов)")
+
+    task = tasks.get(req.task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена или устарела (TTL 30 мин)")
+
+    context = task.get("context")
+    if not context:
+        raise HTTPException(status_code=400, detail="Контекст задачи недоступен")
+
+    question = req.question_text or req.question_title
+
+    try:
+        prompt = load_prompt(REFINE_PROMPT_PATH) \
+            .replace("{{QUESTION}}", question) \
+            .replace("{{CONTRACT_TEXT}}", context)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.info(f"[REFINE] {req.task_id[:8]}: {req.question_title}")
+    parsed = await call_api(prompt, req.task_id, f"REFINE/{req.question_title[:20]}")
+
+    if not parsed or not isinstance(parsed, list) or len(parsed) == 0:
+        raise HTTPException(status_code=502, detail="Модель не вернула ответ. Попробуйте ещё раз.")
+
+    # Логирование usage
+    if user_id:
+        tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in parsed)
+        auth_module.log_usage(user_id, "refine", 0, len(context) // 4, tokens_out, "done")
+
+    return JSONResponse({"item": parsed[0]})
 
 
 # Статика ПОСЛЕ роутов
