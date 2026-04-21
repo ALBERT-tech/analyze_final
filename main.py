@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 API_KEY             = os.getenv("API_KEY", "")
 API_URL             = os.getenv("API_URL", "https://api.agentplatform.ru/v1/chat/completions")
 MODEL               = os.getenv("MODEL", "google/gemini-2.0-flash-001")
+# Резервный провайдер (fallback при 429)
+FALLBACK_API_KEY    = os.getenv("FALLBACK_API_KEY", "")
+FALLBACK_API_URL    = os.getenv("FALLBACK_API_URL", "https://api.timeweb.ai/v1/chat/completions")
+FALLBACK_MODEL      = os.getenv("FALLBACK_MODEL", "gemini/gemini-2.0-flash")
 MAX_TOKENS_PER_CALL = int(os.getenv("MAX_TOKENS_PER_CALL", "12000"))
 MAX_CONTEXT_CHARS   = int(os.getenv("MAX_CONTEXT_CHARS", "500000"))
 
@@ -186,45 +190,54 @@ def load_prompt(path: Path) -> str:
 
 # -- Вызов API -------------------------------------------------------------
 
-async def call_api(prompt_text: str, task_id: str, label: str) -> list | None:
-    """Один вызов LLM API. Возвращает JSON-массив или None."""
-    logger.info(f"[TASK {task_id[:8]}] [{label}] Отправка ({len(prompt_text)} симв.)")
-
+async def _try_api(url: str, key: str, model: str, prompt_text: str,
+                   task_id: str, label: str, provider: str) -> tuple[list | None, int]:
+    """Один вызов API. Возвращает (parsed_or_None, http_status)."""
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.post(
-                API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {API_KEY}",
-                },
+                url,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
                 json={
-                    "model": MODEL,
+                    "model": model,
                     "messages": [{"role": "user", "content": prompt_text}],
                     "temperature": 0.1,
                     "max_tokens": MAX_TOKENS_PER_CALL,
                 },
             )
-
         if response.status_code != 200:
-            logger.error(f"[TASK {task_id[:8]}] [{label}] API ошибка {response.status_code}: {response.text[:300]}")
-            return None
+            logger.error(f"[TASK {task_id[:8]}] [{label}] [{provider}] API ошибка {response.status_code}: {response.text[:300]}")
+            return None, response.status_code
 
         raw = response.json()["choices"][0]["message"]["content"].strip()
-        logger.info(f"[TASK {task_id[:8]}] [{label}] Ответ ({len(raw)} симв.)")
-
-        # Чистим markdown
+        logger.info(f"[TASK {task_id[:8]}] [{label}] [{provider}] Ответ ({len(raw)} симв.)")
         m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
         clean = m.group(1).strip() if m else raw
-
         parsed = _try_parse_json(clean, task_id)
         if parsed:
-            logger.info(f"[TASK {task_id[:8]}] [{label}] Распарсено {len(parsed)} объектов")
-        return parsed
-
+            logger.info(f"[TASK {task_id[:8]}] [{label}] [{provider}] Распарсено {len(parsed)} объектов")
+        return parsed, 200
     except Exception as e:
-        logger.error(f"[TASK {task_id[:8]}] [{label}] Ошибка: {e}")
-        return None
+        logger.error(f"[TASK {task_id[:8]}] [{label}] [{provider}] Ошибка: {e}")
+        return None, 0
+
+
+async def call_api(prompt_text: str, task_id: str, label: str) -> list | None:
+    """Вызов LLM API с fallback при 429. Отмечает в tasks[task_id] использование резерва."""
+    logger.info(f"[TASK {task_id[:8]}] [{label}] Отправка ({len(prompt_text)} симв.)")
+
+    # Попытка 1: основной провайдер
+    parsed, status = await _try_api(API_URL, API_KEY, MODEL, prompt_text, task_id, label, "MAIN")
+
+    # Fallback при 429 или сетевой ошибке
+    if parsed is None and status in (0, 429, 502, 503, 504) and FALLBACK_API_KEY:
+        logger.warning(f"[TASK {task_id[:8]}] [{label}] Основной провайдер недоступен ({status}), переключаюсь на резервный")
+        parsed, status = await _try_api(FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL,
+                                        prompt_text, task_id, label, "FALLBACK")
+        if parsed and task_id in tasks:
+            tasks[task_id]["fallback_used"] = True
+
+    return parsed
 
 
 # -- Сборка контекста ------------------------------------------------------
