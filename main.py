@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 # -- Конфиг ---------------------------------------------------------------
 API_KEY             = os.getenv("API_KEY", "")
-API_URL             = os.getenv("API_URL", "https://litellm.tokengate.ru/v1/chat/completions")
+API_URL             = os.getenv("API_URL", "https://api.agentplatform.ru/v1/chat/completions")
 MODEL               = os.getenv("MODEL", "google/gemini-2.0-flash-001")
 MAX_TOKENS_PER_CALL = int(os.getenv("MAX_TOKENS_PER_CALL", "12000"))
 MAX_CONTEXT_CHARS   = int(os.getenv("MAX_CONTEXT_CHARS", "500000"))
