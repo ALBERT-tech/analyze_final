@@ -121,7 +121,17 @@ footer a { color:var(--primary); text-decoration:none; }
 }
 </style>
 </head>
-<body>
+<body data-role="__USER_ROLE__">
+<div id="admin-clock" class="admin-only" style="position:fixed;top:8px;left:12px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--text-secondary);z-index:1000;"></div>
+<script>
+(function(){
+  var el=document.getElementById('admin-clock');
+  if(!el)return;
+  var pad=function(n){return(n<10?'0':'')+n;};
+  var tick=function(){var d=new Date();el.textContent=pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());};
+  tick();setInterval(tick,1000);
+})();
+</script>
 <div class="container">
 
 <div style="display:flex;gap:16px;justify-content:flex-end;margin-bottom:8px;font-size:13px;" data-role="__USER_ROLE__">
