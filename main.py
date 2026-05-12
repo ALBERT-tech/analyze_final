@@ -184,8 +184,14 @@ def load_default_prompt() -> str:
 
 def extract_purchase_number(results: list) -> str | None:
     """Извлекает номер закупки из results модели.
-    Ищет элемент с title про номер закупки, потом длинное число в answer.
-    Возвращает строку с номером или None если не нашёл.
+
+    Стратегия (3 уровня):
+      1. Контекстный поиск: «номер извещения: N», «закупка № N» — самый надёжный,
+         работает для коротких номеров (Торги РФ: 4360) и длинных (44-ФЗ: 19 цифр).
+      2. Длинные числа: 19/11/7-8 цифр (44-ФЗ / 223-ФЗ / РТС-РосТендер).
+      3. Любое 4+ значное число, кроме годов (19XX/20XX).
+
+    Возвращает строку с номером или None.
     """
     if not results:
         return None
@@ -193,15 +199,49 @@ def extract_purchase_number(results: list) -> str | None:
         if not isinstance(item, dict):
             continue
         title_upper = (item.get("title") or "").upper()
-        if "НОМЕР" in title_upper and ("ЗАКУПК" in title_upper or "ИЗВЕЩ" in title_upper):
-            answer = (item.get("answer") or "")
-            if "не найден" in answer.lower():
-                return None
-            # 19 цифр — 44-ФЗ реестровый, 11 — 223-ФЗ, 7-8 — РТС/площадки
-            match = re.search(r"\b(\d{19}|\d{11}|\d{7,8})\b", answer)
+        if not ("НОМЕР" in title_upper and ("ЗАКУПК" in title_upper or "ИЗВЕЩ" in title_upper)):
+            continue
+        answer = (item.get("answer") or "")
+        if "не найден" in answer.lower():
+            return None
+
+        # Стратегия 1: контекстный поиск (4-19 цифр)
+        context_patterns = [
+            r"номер\s+извещени[яеи][:\s]+№?\s*(\d{3,19})",
+            r"извещени[яеи]\s*№\s*(\d{3,19})",
+            r"закупк[аи]\s*№\s*(\d{3,19})",
+            r"реестровый\s+номер[:\s]+(\d{3,19})",
+            r"номер\s+закупк[аи][:\s]+№?\s*(\d{3,19})",
+            r"№\s*(\d{4,19})",  # после № — обычно номер, не год
+        ]
+        for pattern in context_patterns:
+            match = re.search(pattern, answer, re.IGNORECASE)
             if match:
-                return match.group(1)
+                num = match.group(1)
+                if _is_valid_purchase_number(num):
+                    return num
+
+        # Стратегия 2: длинные числа (типичные форматы площадок)
+        match = re.search(r"\b(\d{19}|\d{11}|\d{7,8})\b", answer)
+        if match:
+            return match.group(1)
+
+        # Стратегия 3: расширенный fallback — первое 4+ значное число (кроме годов)
+        for match in re.finditer(r"\b(\d{4,19})\b", answer):
+            num = match.group(1)
+            if _is_valid_purchase_number(num):
+                return num
     return None
+
+
+def _is_valid_purchase_number(num: str) -> bool:
+    """Отсекает явные ложные срабатывания (годы, телефоны)."""
+    if not (4 <= len(num) <= 19):
+        return False
+    # 4-значные годы (19XX, 20XX, 21XX) — не номер
+    if len(num) == 4 and num[:2] in ("19", "20", "21"):
+        return False
+    return True
 
 
 def build_files_meta(docs: list[dict], extracted: list) -> list[dict]:

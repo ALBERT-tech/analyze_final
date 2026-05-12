@@ -720,7 +720,9 @@ document.getElementById('printBtn').addEventListener('click', () => {
   window.addEventListener('afterprint', restore);
   // Fallback на случай если afterprint не сработает (старые браузеры)
   setTimeout(restore, 10000);
-  window.print();
+  // Даём браузеру отрисовать новый title перед открытием диалога печати —
+  // иначе Chrome иногда успевает считать старый title.
+  requestAnimationFrame(() => requestAnimationFrame(() => window.print()));
 });
 
 // ── Helpers ───────────────────────────────────────────────
