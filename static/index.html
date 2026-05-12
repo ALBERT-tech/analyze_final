@@ -223,7 +223,7 @@ footer a { color:var(--primary); text-decoration:none; }
   </div>
   <div class="save-group">
     <button class="btn-secondary btn-sm" id="saveTxtBtn">⬇ TXT</button>
-    <button class="btn-secondary btn-sm" onclick="window.print()">🖨 PDF / Печать</button>
+    <button class="btn-secondary btn-sm" id="printBtn">🖨 PDF / Печать</button>
   </div>
 </div>
 <div id="resultsContainer"></div>
@@ -680,15 +680,20 @@ function buildClientReport() {
   return txt;
 }
 
-function buildReportFilename() {
+function buildReportBasename() {
+  /* Имя отчёта без расширения. */
   if (lastPurchaseNumber) {
-    return `отчёт по закупке № ${lastPurchaseNumber}.txt`;
+    return `отчёт по закупке № ${lastPurchaseNumber}`;
   }
   // Без номера — серверное время в формате YYYY-MM-DD HH-MM
   const d = lastCompletedAt ? new Date(lastCompletedAt * 1000) : new Date();
   const pad = n => (n < 10 ? '0' : '') + n;
   const stamp = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}-${pad(d.getMinutes())}`;
-  return `отчёт от ${stamp}.txt`;
+  return `отчёт от ${stamp}`;
+}
+
+function buildReportFilename() {
+  return buildReportBasename() + '.txt';
 }
 
 document.getElementById('saveTxtBtn').addEventListener('click', () => {
@@ -700,6 +705,22 @@ document.getElementById('saveTxtBtn').addEventListener('click', () => {
   a.href = URL.createObjectURL(blob);
   a.download = buildReportFilename();
   a.click();
+});
+
+document.getElementById('printBtn').addEventListener('click', () => {
+  if (!lastResults) { window.print(); return; }
+  // Браузер при «Сохранить как PDF» берёт имя из document.title.
+  // Подменяем перед печатью и восстанавливаем после.
+  const originalTitle = document.title;
+  document.title = buildReportBasename();
+  const restore = () => {
+    document.title = originalTitle;
+    window.removeEventListener('afterprint', restore);
+  };
+  window.addEventListener('afterprint', restore);
+  // Fallback на случай если afterprint не сработает (старые браузеры)
+  setTimeout(restore, 10000);
+  window.print();
 });
 
 // ── Helpers ───────────────────────────────────────────────
