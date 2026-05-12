@@ -187,7 +187,8 @@ async function loadUsers() {
       <td style="font-family:monospace;font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;" title="${u.api_key}">${u.api_key.substring(0,8)}...</td>
       <td>
         <button onclick="event.stopPropagation();toggleUser(${u.id},${u.active})" class="${u.active ? 'btn-danger' : ''}" style="margin-right:4px;">${u.active ? 'Блок' : 'Разблок'}</button>
-        <button onclick="event.stopPropagation();showResetModal(${u.id},'${u.login}')">Пароль</button>
+        <button onclick="event.stopPropagation();showResetModal(${u.id},'${u.login}')" style="margin-right:4px;">Пароль</button>
+        ${u.id === 1 ? '' : `<button class="btn-danger" onclick="event.stopPropagation();deleteUserConfirm(${u.id},'${u.login.replace(/'/g, "\\'")}')">🗑</button>`}
       </td>`;
     tr.addEventListener('click', () => toggleDetail(u.id));
     tbody.appendChild(tr);
@@ -331,6 +332,15 @@ async function deleteCache(purchaseNumber) {
 
 async function toggleUser(id, currentActive) {
   await fetch('/admin/api/toggle_user/' + id, {method:'POST'});
+  loadUsers();
+}
+
+async function deleteUserConfirm(id, login) {
+  if (!confirm(`Удалить пользователя «${login}»?\n\nАккаунт будет полностью удалён.\nЛог использования сохранится для аудита.`)) return;
+  const r = await fetch('/admin/api/delete_user/' + id, {method: 'DELETE'});
+  let d = {};
+  try { d = await r.json(); } catch {}
+  if (!r.ok) { alert('Ошибка: ' + (d.detail || r.status)); return; }
   loadUsers();
 }
 

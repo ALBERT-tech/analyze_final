@@ -1443,6 +1443,28 @@ async def admin_reset_password(user_id: int, req: ResetPasswordRequest, request:
     return JSONResponse({"ok": True})
 
 
+@app.delete("/admin/api/delete_user/{user_id}")
+async def admin_delete_user(user_id: int, request: Request):
+    """Удалить пользователя. Защита: нельзя удалить главного admin (id=1)
+    и нельзя удалить самого себя."""
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    if user["id"] == user_id:
+        raise HTTPException(status_code=400, detail="Нельзя удалить самого себя")
+    ok, msg = auth_module.delete_user(user_id)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    # Инвалидируем активные cookie-сессии удалённого пользователя
+    expired_tokens = [tok for tok, uid in sessions.items() if uid == user_id]
+    for tok in expired_tokens:
+        del sessions[tok]
+    if expired_tokens:
+        logger.info(f"[ADMIN] Инвалидировано {len(expired_tokens)} активных сессий удалённого user_id={user_id}")
+    logger.info(f"[ADMIN] {user['login']} удалил пользователя: {msg}")
+    return JSONResponse({"ok": True, "login": msg})
+
+
 # -- Admin API: кэш тендеров ---------------------------------------------
 
 @app.get("/admin/api/cache_list")

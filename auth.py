@@ -179,6 +179,28 @@ def reset_password(login: str, new_password: str) -> bool:
     return True
 
 
+def delete_user(user_id: int) -> tuple[bool, str]:
+    """Удаляет пользователя. usage_log записи остаются (для аудита).
+
+    Возвращает (success, message). Нельзя удалить:
+      - первого admin (id=1) — это безопасность от случайного удаления
+      - несуществующего пользователя
+    """
+    if user_id == 1:
+        return False, "Нельзя удалить главного admin (id=1)"
+    conn = _get_db()
+    user = conn.execute("SELECT login FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        conn.close()
+        return False, "Пользователь не найден"
+    login = user["login"]
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"[AUTH] Удалён пользователь: id={user_id}, login={login} (usage_log сохранён)")
+    return True, login
+
+
 # -- Лимиты ----------------------------------------------------------------
 
 def check_daily_limit(user_id: int) -> tuple[bool, int, int]:
