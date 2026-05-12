@@ -38,6 +38,7 @@ class ExtractedFile:
     doc_type: str = "НЕИЗВЕСТНО"
     skipped: bool = False
     skip_reason: str = ""
+    size_bytes: int = 0
 
 
 # -- ZIP ------------------------------------------------------------------
@@ -255,32 +256,46 @@ def extract_files(uploaded_paths: list[Path]) -> list[ExtractedFile]:
     for file_path in all_files:
         ext = file_path.suffix.lower()
         name = file_path.name
+        try:
+            size_bytes = file_path.stat().st_size
+        except OSError:
+            size_bytes = 0
 
-        # Пропускаем служебные файлы из ZIP
+        # Служебные файлы из ZIP (__MACOSX, .DS_Store и т.п.) — тихо игнорируем
         if any(part.startswith("__") or part.startswith(".") for part in file_path.parts):
             logger.info(f"[ПРОПУСК] Служебный: {name}")
             continue
 
         if ext in SKIP_EXTENSIONS:
             logger.info(f"[ПРОПУСК] {ext}: {name}")
+            results.append(ExtractedFile(
+                name=name, path=str(file_path), text="", size_bytes=size_bytes,
+                skipped=True, skip_reason=f"формат {ext} не поддерживается (картинки/презентации)",
+            ))
             continue
 
         handler = FORMAT_HANDLERS.get(ext)
         if not handler:
             logger.info(f"[ПРОПУСК] Неизвестный формат {ext}: {name}")
+            results.append(ExtractedFile(
+                name=name, path=str(file_path), text="", size_bytes=size_bytes,
+                skipped=True, skip_reason=f"неизвестный формат {ext}",
+            ))
             continue
 
         try:
             text = handler(file_path)
             if len(text.strip()) < 50:
                 logger.warning(f"[ВНИМАНИЕ] {name}: текст короткий ({len(text)} симв.)")
-            results.append(ExtractedFile(name=name, path=str(file_path), text=text))
+            results.append(ExtractedFile(
+                name=name, path=str(file_path), text=text, size_bytes=size_bytes,
+            ))
         except Exception as e:
             logger.error(f"[ОШИБКА] {name}: {e}")
             logger.error(traceback.format_exc())
             results.append(ExtractedFile(
-                name=name, path=str(file_path), text="",
-                skipped=True, skip_reason=f"Ошибка: {str(e)[:120]}"
+                name=name, path=str(file_path), text="", size_bytes=size_bytes,
+                skipped=True, skip_reason=f"ошибка чтения: {str(e)[:120]}",
             ))
 
     # Очистка временных директорий

@@ -182,6 +182,65 @@ def load_default_prompt() -> str:
     return "{{CONTRACT_TEXT}}"
 
 
+def extract_purchase_number(results: list) -> str | None:
+    """Извлекает номер закупки из results модели.
+    Ищет элемент с title про номер закупки, потом длинное число в answer.
+    Возвращает строку с номером или None если не нашёл.
+    """
+    if not results:
+        return None
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        title_upper = (item.get("title") or "").upper()
+        if "НОМЕР" in title_upper and ("ЗАКУПК" in title_upper or "ИЗВЕЩ" in title_upper):
+            answer = (item.get("answer") or "")
+            if "не найден" in answer.lower():
+                return None
+            # 19 цифр — 44-ФЗ реестровый, 11 — 223-ФЗ, 7-8 — РТС/площадки
+            match = re.search(r"\b(\d{19}|\d{11}|\d{7,8})\b", answer)
+            if match:
+                return match.group(1)
+    return None
+
+
+def build_files_meta(docs: list[dict], extracted: list) -> list[dict]:
+    """Собирает meta-инфу по всем файлам: успешные + пропущенные.
+
+    docs       — валидные документы (из valid после классификации)
+    extracted  — всё что вернул extract_files (включая skipped)
+
+    Возвращает список словарей с полями:
+      name, type, size_bytes, chars, tokens, status, skip_reason
+    """
+    meta_files: list[dict] = []
+    # Успешные документы
+    for d in docs:
+        chars = d.get("char_count", 0)
+        meta_files.append({
+            "name": d["name"],
+            "type": d["type"],
+            "size_bytes": d.get("size_bytes", 0),
+            "chars": chars,
+            "tokens": chars // 4,
+            "status": "ok" if chars >= 50 else "warn_short",
+            "skip_reason": "" if chars >= 50 else "текст короткий (возможно скан без OCR)",
+        })
+    # Пропущенные
+    for f in extracted:
+        if f.skipped:
+            meta_files.append({
+                "name": f.name,
+                "type": "—",
+                "size_bytes": getattr(f, "size_bytes", 0),
+                "chars": 0,
+                "tokens": 0,
+                "status": "skipped",
+                "skip_reason": f.skip_reason,
+            })
+    return meta_files
+
+
 def load_prompt(path: Path) -> str:
     if path.exists():
         return path.read_text(encoding="utf-8")
@@ -272,16 +331,21 @@ def format_report(risks: list, params: list, warnings: list, meta: dict) -> str:
     """Текстовый отчёт: Блок 1 (Риски) + Блок 2 (Параметры)."""
     lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
 
-    # Обработанные файлы
+    # Обработанные файлы (исключая skipped)
     files = meta.get("files", [])
-    if files:
+    ok_files = [f for f in files if f.get("status") != "skipped"]
+    if ok_files:
         lines.append("Обработанные файлы:")
-        for f in files:
-            lines.append(f'  + {f["name"]} ({f["type"]}, {f["chars"]} симв.)')
+        for f in ok_files:
+            tokens = f.get("tokens") or (f.get("chars", 0) // 4)
+            lines.append(f'  + {f["name"]} ({f["type"]}, {f["chars"]} симв., ~{tokens} токенов)')
         lines.append("")
 
-    # Пропущенные файлы
-    skipped = meta.get("skipped", [])
+    # Пропущенные файлы — берём из meta.files со status=skipped (предпочтительно),
+    # фолбэк на старое meta.skipped для совместимости.
+    skipped_from_files = [{"name": f["name"], "reason": f.get("skip_reason", "")}
+                          for f in files if f.get("status") == "skipped"]
+    skipped = skipped_from_files or meta.get("skipped", [])
     if skipped:
         lines.append("Не обработаны:")
         for s in skipped:
@@ -395,6 +459,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                 "type": doc_type,
                 "sections": sections,
                 "char_count": len(f.text),
+                "size_bytes": getattr(f, "size_bytes", 0),
             })
             logger.info(f"[TASK {task_id[:8]}] {f.name}: тип={doc_type}, {len(f.text)} симв.")
 
@@ -449,13 +514,18 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
         total = len(risks_result) + len(params_result)
         logger.info(f"[TASK {task_id[:8]}] Итого: рисков={len(risks_result)}, параметров={len(params_result)}")
 
+        files_meta = build_files_meta(docs, extracted)
         meta = {
-            "files": [{"name": d["name"], "type": d["type"], "chars": d["char_count"]} for d in docs],
-            "skipped": skipped,
+            "files": files_meta,
+            "skipped": skipped,  # для обратной совместимости со старым UI/Битрикс
             "context_chars": context_chars,
+            "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta),
         }
-        text_report = format_report(risks_result, params_result, warnings, meta)
         flat_results = risks_result + params_result
+        purchase_number = extract_purchase_number(flat_results)
+        if purchase_number:
+            logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
+        text_report = format_report(risks_result, params_result, warnings, meta)
 
         task.update(
             status="done",
@@ -466,6 +536,8 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             meta=meta,
             text=text_report,
             context=context,
+            purchase_number=purchase_number,
+            completed_at=time.time(),
         )
 
         # Логирование usage
@@ -490,6 +562,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                         "warnings": warnings,
                         "text": text_report,
                         "meta": meta,
+                        "purchase_number": purchase_number,
                     })
                 logger.info(f"[TASK {task_id[:8]}] Callback отправлен")
             except Exception as cb_err:
@@ -536,7 +609,8 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
             doc_type = classify(f.text, f.name)
             sections = split_into_sections(f.text)
             docs.append({"name": f.name, "type": doc_type,
-                         "sections": sections, "char_count": len(f.text)})
+                         "sections": sections, "char_count": len(f.text),
+                         "size_bytes": getattr(f, "size_bytes", 0)})
             logger.info(f"[TASK {task_id[:8]}] {f.name}: {doc_type}, {len(f.text)} симв.")
 
         task.update(step="context", detail="Сборка контекста...")
@@ -557,13 +631,20 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
 
         task.update(step="parsing", detail="Формирование отчёта...")
 
-        meta = {"files": [{"name": d["name"], "type": d["type"], "chars": d["char_count"]} for d in docs],
+        files_meta = build_files_meta(docs, extracted)
+        meta = {"files": files_meta,
                 "skipped": [{"name": f.name, "reason": f.skip_reason} for f in extracted if f.skipped],
-                "context_chars": context_chars}
+                "context_chars": context_chars,
+                "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta)}
+
+        purchase_number = extract_purchase_number(parsed)
+        if purchase_number:
+            logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
 
         text_report = format_report([], parsed, [], meta)
         task.update(status="done", results=parsed, parameters=parsed, risks=[],
-                    warnings=[], meta=meta, text=text_report, context=context)
+                    warnings=[], meta=meta, text=text_report, context=context,
+                    purchase_number=purchase_number, completed_at=time.time())
 
         # Логирование usage
         uid = task.get("user_id", 0)
@@ -581,6 +662,7 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
                         "external_id": task.get("external_id"),
                         "status": "done",
                         "results": parsed, "text": text_report, "meta": meta,
+                        "purchase_number": purchase_number,
                     })
                 logger.info(f"[TASK {task_id[:8]}] Callback отправлен")
             except Exception as cb_err:
@@ -625,8 +707,14 @@ async def process_task_legacy(task_id: str, saved_paths: list[Path], prompt_temp
             task.update(status="error", detail="Модель не ответила. Попробуйте ещё раз.")
             return
 
-        meta = {"files": [{"name": d["name"], "type": d["type"], "chars": d["char_count"]} for d in docs],
-                "context_chars": context_chars}
+        files_meta_legacy = build_files_meta(docs, extracted)
+        meta = {"files": files_meta_legacy,
+                "context_chars": context_chars,
+                "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta_legacy)}
+
+        purchase_number = extract_purchase_number(parsed)
+        if purchase_number:
+            logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
 
         lines = ["АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ", ""]
         for i, item in enumerate(parsed, 1):
@@ -638,7 +726,8 @@ async def process_task_legacy(task_id: str, saved_paths: list[Path], prompt_temp
                 lines.append(f'   [{item["citation"]}]')
             lines.append("")
 
-        task.update(status="done", results=parsed, meta=meta, text="\n".join(lines).strip())
+        task.update(status="done", results=parsed, meta=meta, text="\n".join(lines).strip(),
+                    purchase_number=purchase_number, completed_at=time.time())
 
     except Exception as e:
         logger.error(f"[TASK {task_id[:8]}] Ошибка: {e}", exc_info=True)
@@ -758,6 +847,7 @@ async def get_status(task_id: str):
         raise HTTPException(status_code=404, detail="Задача не найдена")
 
     if task["status"] == "done":
+        completed_at_ts = task.get("completed_at")
         return JSONResponse({
             "status": "done",
             "risks": task.get("risks", []),
@@ -766,6 +856,8 @@ async def get_status(task_id: str):
             "warnings": task.get("warnings", []),
             "text": task.get("text"),
             "meta": task.get("meta"),
+            "purchase_number": task.get("purchase_number"),
+            "completed_at": completed_at_ts,  # unix timestamp (МСК на сервере)
         })
     elif task["status"] == "error":
         return JSONResponse({

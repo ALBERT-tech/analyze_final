@@ -111,6 +111,22 @@ button { padding:10px 22px; border:none; border-radius:var(--radius); font-weigh
 .skipped-list { margin-top:12px; padding:10px 14px; border-radius:var(--radius); background:#fff8e1; border-left:3px solid #e6a817; font-size:13px; color:#7a5c00; }
 .skipped-list ul { margin-top:4px; padding-left:16px; }
 
+/* Таблица файлов */
+.files-table-wrap { margin:18px 0; }
+.files-table-title { font-size:13px; font-weight:600; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.4px; margin-bottom:8px; }
+.files-table { width:100%; border-collapse:collapse; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; font-size:13px; }
+.files-table th, .files-table td { padding:8px 12px; text-align:left; border-bottom:1px solid var(--border); }
+.files-table th { background:#fafafa; font-weight:500; color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:0.4px; }
+.files-table tbody tr:last-child td { border-bottom:none; }
+.files-table tbody tr:hover { background:var(--primary-light); }
+.files-table td.num { text-align:right; font-variant-numeric:tabular-nums; color:var(--text-secondary); }
+.files-table td.name { font-weight:500; word-break:break-all; }
+.files-table tfoot td { background:#fafafa; font-weight:500; font-size:12px; color:var(--text-secondary); }
+.f-status { display:inline-block; width:18px; text-align:center; }
+.f-status.ok       { color:#2e7d32; }
+.f-status.warn     { color:#e6a817; }
+.f-status.skipped  { color:#b71c1c; }
+
 footer { text-align:center; margin-top:40px; padding-top:20px; border-top:1px solid var(--border); font-size:13px; color:var(--text-secondary); }
 footer a { color:var(--primary); text-decoration:none; }
 
@@ -224,6 +240,9 @@ footer a { color:var(--primary); text-decoration:none; }
 let uploadedFiles = [];
 let lastResults = null;
 let lastMeta = null;
+let lastPurchaseNumber = null;
+let lastCompletedAt = null;   // unix timestamp с сервера
+let lastTextReport = null;    // готовый текстовый отчёт от сервера
 let defaultPrompt = '';
 
 // ── Загружаем промпт с сервера ─────────────────────────────
@@ -376,6 +395,9 @@ async function runAnalysis() {
 
     lastResults = data.results;
     lastMeta = data.meta;
+    lastPurchaseNumber = data.purchase_number || null;
+    lastCompletedAt = data.completed_at || null;
+    lastTextReport = data.text || null;
     renderResults(data, data.meta);
 
   } catch(e) {
@@ -439,6 +461,7 @@ function clearAll() {
   document.getElementById('errorBox').style.display = 'none';
   document.getElementById('analyzeBtn').disabled = true;
   lastResults = null; lastMeta = null;
+  lastPurchaseNumber = null; lastCompletedAt = null; lastTextReport = null;
 }
 
 function showError(msg) {
@@ -448,6 +471,68 @@ function showError(msg) {
 }
 
 // ── Рендер результатов ────────────────────────────────────
+function fmtBytes(n) {
+  if (!n) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function fmtNum(n) {
+  if (!n) return '0';
+  return n.toLocaleString('ru');
+}
+
+function renderFilesTable(meta) {
+  const files = meta?.files || [];
+  if (!files.length) return null;
+
+  const totalChars = files.reduce((s, f) => s + (f.chars || 0), 0);
+  const totalTokens = files.reduce((s, f) => s + (f.tokens || 0), 0);
+  const totalBytes = meta.total_size_bytes || files.reduce((s, f) => s + (f.size_bytes || 0), 0);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'files-table-wrap';
+  wrap.innerHTML = `
+    <div class="files-table-title">📎 Файлы в задаче (${files.length})</div>
+    <table class="files-table">
+      <thead><tr>
+        <th style="width:32px;"></th>
+        <th>Файл</th>
+        <th>Категория</th>
+        <th class="num" style="width:80px;">Размер</th>
+        <th class="num" style="width:90px;">Символов</th>
+        <th class="num" style="width:90px;">~Токенов</th>
+      </tr></thead>
+      <tbody>
+        ${files.map(f => {
+          const st = f.status || 'ok';
+          const icon = st === 'ok' ? '✓' : st === 'warn_short' ? '⚠' : '✗';
+          const cls = st === 'ok' ? 'ok' : st === 'warn_short' ? 'warn' : 'skipped';
+          const title = (f.skip_reason && st !== 'ok') ? `title="${esc(f.skip_reason)}"` : '';
+          return `<tr ${title}>
+            <td><span class="f-status ${cls}">${icon}</span></td>
+            <td class="name">${esc(f.name)}</td>
+            <td>${esc(f.type || '—')}</td>
+            <td class="num">${fmtBytes(f.size_bytes)}</td>
+            <td class="num">${fmtNum(f.chars)}</td>
+            <td class="num">${fmtNum(f.tokens)}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+      <tfoot><tr>
+        <td></td>
+        <td>Итого передано в модель:</td>
+        <td></td>
+        <td class="num">${fmtBytes(totalBytes)}</td>
+        <td class="num">${fmtNum(totalChars)}</td>
+        <td class="num">~${fmtNum(totalTokens)}</td>
+      </tr></tfoot>
+    </table>
+  `;
+  return wrap;
+}
+
 function renderResults(data, meta) {
   const container = document.getElementById('resultsContainer');
   container.innerHTML = '';
@@ -467,19 +552,15 @@ function renderResults(data, meta) {
     container.appendChild(warnDiv);
   }
 
-  // Пропущенные файлы
-  if (meta?.skipped?.length) {
-    const skippedDiv = document.createElement('div');
-    skippedDiv.className = 'skipped-list';
-    skippedDiv.innerHTML = `<strong>Пропущены файлы:</strong><ul>${
-      meta.skipped.map(s => `<li><b>${esc(s.name)}</b> — ${esc(s.reason)}</li>`).join('')
-    }</ul>`;
-    container.appendChild(skippedDiv);
-  }
+  // Таблица файлов (заменяет старый skipped-list — у файлов теперь есть статус)
+  const filesTable = renderFilesTable(meta);
+  if (filesTable) container.appendChild(filesTable);
 
-  const now = new Date().toLocaleString('ru', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
-  const fileLabels = meta?.files?.map(f => `${f.name} (${f.type})`).join(', ') || '';
-  document.getElementById('resultsMeta').textContent = `${now}  ·  ${fileLabels}`;
+  // Дата отчёта: предпочтительно серверная
+  const reportDate = lastCompletedAt ? new Date(lastCompletedAt * 1000) : new Date();
+  const now = reportDate.toLocaleString('ru', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  const numLabel = lastPurchaseNumber ? `Закупка № ${lastPurchaseNumber}  ·  ` : '';
+  document.getElementById('resultsMeta').textContent = `${numLabel}${now}`;
   document.getElementById('resultsHdr').style.display = 'flex';
 
   // Если есть блоки risks/parameters — новый формат
@@ -584,21 +665,40 @@ async function refineAnswer(card, item) {
 }
 
 // ── Сохранение TXT ────────────────────────────────────────
-document.getElementById('saveTxtBtn').addEventListener('click', () => {
-  if (!lastResults) return;
-  const now = new Date().toLocaleString('ru');
+function buildClientReport() {
+  /* Фолбэк-генерация отчёта, если сервер не прислал text. */
+  const reportDate = lastCompletedAt ? new Date(lastCompletedAt * 1000) : new Date();
+  const now = reportDate.toLocaleString('ru');
   const files = lastMeta?.files?.map(f => f.name).join(', ') || '';
   let txt = `АНАЛИЗ ТЕНДЕРНОЙ ДОКУМЕНТАЦИИ\nДата: ${now}\nФайлы: ${files}\n${'='.repeat(60)}\n\n`;
-  lastResults.forEach((item, i) => {
+  (lastResults || []).forEach((item, i) => {
     txt += `${i+1}. ${(item.title||'').toUpperCase()}\n${'─'.repeat(40)}\n`;
     txt += `Ответ: ${item.answer || 'Информация не найдена'}\n`;
     if (item.citation?.trim().length > 5) txt += `Цитата: ${item.citation}\n`;
     txt += '\n';
   });
+  return txt;
+}
+
+function buildReportFilename() {
+  if (lastPurchaseNumber) {
+    return `отчёт по закупке № ${lastPurchaseNumber}.txt`;
+  }
+  // Без номера — серверное время в формате YYYY-MM-DD HH-MM
+  const d = lastCompletedAt ? new Date(lastCompletedAt * 1000) : new Date();
+  const pad = n => (n < 10 ? '0' : '') + n;
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}-${pad(d.getMinutes())}`;
+  return `отчёт от ${stamp}.txt`;
+}
+
+document.getElementById('saveTxtBtn').addEventListener('click', () => {
+  if (!lastResults) return;
+  // Серверный текст приоритетнее — там есть источники с doc/ref/citation
+  const txt = lastTextReport || buildClientReport();
   const blob = new Blob([txt], { type: 'text/plain;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `tender-report-${new Date().toISOString().slice(0,10)}.txt`;
+  a.download = buildReportFilename();
   a.click();
 });
 
