@@ -34,6 +34,7 @@ from pipeline.extractor import extract_files
 from pipeline.classifier import classify
 from pipeline.splitter import split_into_sections
 import auth as auth_module
+import cache as cache_module
 
 load_dotenv()
 
@@ -56,10 +57,14 @@ SESSION_SECRET      = os.getenv("SESSION_SECRET", "tender-analyzer-secret-key-ch
 
 # -- Сессии (cookie → user_id) ---------------------------------------------
 sessions: dict[str, int] = {}  # session_token → user_id
-RISKS_PROMPT_PATH   = Path("prompts/risks.txt")
-PARAMS_PROMPT_PATH  = Path("prompts/params.txt")
-SHORT_PROMPT_PATH   = Path("prompts/short.txt")
-REFINE_PROMPT_PATH  = Path("prompts/refine.txt")
+RISKS_PROMPT_PATH         = Path("prompts/risks.txt")
+PARAMS_PROMPT_PATH        = Path("prompts/params.txt")
+SHORT_PROMPT_PATH         = Path("prompts/short.txt")
+REFINE_PROMPT_PATH        = Path("prompts/refine.txt")
+EXTRACT_NUMBER_PROMPT_PATH = Path("prompts/extract_number.txt")
+
+# Максимум символов извещения, отправляемых в LLM для извлечения номера
+EXTRACT_NUMBER_MAX_CHARS = 30000
 
 # -- Хранилище задач -------------------------------------------------------
 tasks: dict[str, dict] = {}
@@ -83,6 +88,7 @@ app = FastAPI(title="Анализатор тендерной документа�
 
 # Инициализация БД
 auth_module.init_db()
+cache_module.init_db()
 
 # Пути без авторизации
 PUBLIC_PATHS = {"/auth/login", "/health", "/openapi.json", "/docs", "/favicon.ico"}
@@ -339,6 +345,137 @@ async def call_api(prompt_text: str, task_id: str, label: str) -> list | None:
     return parsed
 
 
+# -- Извлечение номера закупки через LLM (для кэша) ------------------------
+
+async def _try_api_raw_text(url: str, key: str, model: str, prompt_text: str,
+                             task_id: str, label: str, provider: str) -> tuple[str | None, int]:
+    """Вызов API, возвращает сырой текст ответа (без JSON-парсинга). Для коротких запросов."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    "temperature": 0.0,
+                    "max_tokens": 100,
+                },
+            )
+        if response.status_code != 200:
+            logger.error(f"[TASK {task_id[:8]}] [{label}] [{provider}] API ошибка {response.status_code}: {response.text[:200]}")
+            return None, response.status_code
+        raw = response.json()["choices"][0]["message"]["content"].strip()
+        logger.info(f"[TASK {task_id[:8]}] [{label}] [{provider}] Ответ: {raw[:80]}")
+        return raw, 200
+    except Exception as e:
+        logger.error(f"[TASK {task_id[:8]}] [{label}] [{provider}] Ошибка: {e}")
+        return None, 0
+
+
+async def extract_number_via_llm(notice_text: str, task_id: str) -> str | None:
+    """Отдельный быстрый LLM-вызов: «найди номер закупки» по тексту извещения.
+
+    Использует основную модель, при 429 — резервную. На вход уходит только текст
+    извещений (обрезанный до EXTRACT_NUMBER_MAX_CHARS), на выход — одна строка.
+    """
+    if not notice_text or not notice_text.strip():
+        return None
+    try:
+        prompt = load_prompt(EXTRACT_NUMBER_PROMPT_PATH).replace("{{NOTICE_TEXT}}", notice_text)
+    except FileNotFoundError:
+        logger.warning(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] Промпт extract_number.txt не найден")
+        return None
+
+    logger.info(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] Отправка ({len(prompt)} симв.)")
+    raw, status = await _try_api_raw_text(API_URL, API_KEY, MODEL, prompt, task_id, "EXTRACT_NUMBER", "MAIN")
+
+    if raw is None and status in (0, 429, 502, 503, 504) and FALLBACK_API_KEY:
+        logger.warning(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] Основной {status} — fallback")
+        raw, status = await _try_api_raw_text(FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL,
+                                              prompt, task_id, "EXTRACT_NUMBER", "FALLBACK")
+
+    if not raw:
+        return None
+
+    text = raw.strip().strip('"').strip("'").strip("`").strip()
+    if text.upper() == "NONE" or "не найден" in text.lower():
+        return None
+
+    match = re.search(r"\b(\d{3,19})\b", text)
+    if match and _is_valid_purchase_number(match.group(1)):
+        return match.group(1)
+    return None
+
+
+async def _try_cache_match(task_id: str, extracted: list, mode: str) -> bool:
+    """Pre-step: ищет извещение, извлекает номер через LLM, проверяет кэш.
+
+    Возвращает True, если найден cached_exists (task.status переведён, pipeline должен выйти).
+    Возвращает False, если нужен полный анализ (в task сохранён purchase_number_prefetched).
+    """
+    task = tasks[task_id]
+    valid = [f for f in extracted if not f.skipped and f.text.strip()]
+
+    # Категория ИЗВЕЩЕНИЕ — только из неё извлекаем номер
+    notice_files = [f for f in valid if classify(f.text, f.name) == "ИЗВЕЩЕНИЕ"]
+    if not notice_files:
+        logger.info(f"[TASK {task_id[:8]}] [CACHE] Извещение не найдено — кэш не проверяем")
+        return False
+
+    notice_text = "\n\n".join(f.text for f in notice_files)[:EXTRACT_NUMBER_MAX_CHARS]
+
+    task.update(step="cache_check", detail="Извлечение номера закупки...")
+    number = await extract_number_via_llm(notice_text, task_id)
+
+    if not number:
+        logger.info(f"[TASK {task_id[:8]}] [CACHE] Номер не извлечён — кэш не проверяем")
+        return False
+
+    logger.info(f"[TASK {task_id[:8]}] [CACHE] Номер из извещения: {number}")
+    task["purchase_number_prefetched"] = number
+
+    # Логируем токены extract_number в usage_log
+    uid = task.get("user_id", 0)
+    if uid:
+        # ~prompt_tokens = len(prompt)/4 — мы тратим основной объём на чтение
+        auth_module.log_usage(uid, "extract_number", 0, len(notice_text) // 4, 10, "done")
+
+    cached = cache_module.get_cache(number)
+    if not cached:
+        logger.info(f"[TASK {task_id[:8]}] [CACHE] В кэше нет — будет полный анализ")
+        return False
+
+    new_size = sum(getattr(f, "size_bytes", 0) for f in extracted if not f.skipped)
+    cached_size = cached.get("total_size_bytes", 0)
+
+    task.update(
+        status="cached_exists",
+        step="awaiting_decision",
+        detail="Тендер уже анализировался ранее — ждём решения пользователя",
+        purchase_number=number,
+        awaiting_decision=True,
+        cached_info={
+            "purchase_number": number,
+            "created_at": cached["created_at"],
+            "expires_at": cached["expires_at"],
+            "user_login": cached.get("user_login", ""),
+            "mode": cached.get("mode", ""),
+            "current_mode": mode,
+            "total_size_bytes": cached_size,
+            "current_size_bytes": new_size,
+            "size_changed": new_size != cached_size,
+            "hit_count": cached.get("hit_count", 0),
+        },
+    )
+    task["_cached_data"] = cached
+    logger.info(
+        f"[TASK {task_id[:8]}] [CACHE] CACHED_EXISTS: №{number}, "
+        f"размер {'совпадает' if new_size == cached_size else 'отличается'}"
+    )
+    return True
+
+
 # -- Сборка контекста ------------------------------------------------------
 
 def build_full_context(docs: list[dict], max_chars: int) -> tuple[str, int]:
@@ -487,6 +624,13 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
 
         logger.info(f"[TASK {task_id[:8]}] Извлечено: {len(valid)} файлов, пропущено: {len(skipped)}")
 
+        # -- Шаг 1.5: Проверка кэша по номеру (skip если force_refresh) --
+        if not task.get("force_refresh"):
+            if await _try_cache_match(task_id, extracted, "full"):
+                # cached_exists — pipeline останавливается, ждём решение через /decide.
+                # tmp_dir НЕ удаляем (флаг awaiting_decision проверится в finally).
+                return
+
         # -- Шаг 2: Нарезка на разделы (для логов и мета) --
         task.update(step="classifying", detail="Обработка документов...")
 
@@ -562,7 +706,9 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta),
         }
         flat_results = risks_result + params_result
-        purchase_number = extract_purchase_number(flat_results)
+        # Предпочитаем номер, извлечённый отдельным LLM-запросом на pre-step.
+        # Если его нет (нет извещения / NONE) — пытаемся вытащить из самого ответа.
+        purchase_number = task.get("purchase_number_prefetched") or extract_purchase_number(flat_results)
         if purchase_number:
             logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
         text_report = format_report(risks_result, params_result, warnings, meta)
@@ -579,6 +725,26 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             purchase_number=purchase_number,
             completed_at=time.time(),
         )
+
+        # Запись в кэш (только если номер известен)
+        if purchase_number:
+            try:
+                user_login = ""
+                uid = task.get("user_id", 0)
+                if uid:
+                    u = auth_module.get_user_by_id(uid)
+                    if u:
+                        user_login = u["login"]
+                cache_module.save_cache(
+                    purchase_number=purchase_number, mode="full",
+                    total_size_bytes=meta["total_size_bytes"],
+                    result={"results": flat_results, "risks": risks_result,
+                            "parameters": params_result, "warnings": warnings},
+                    files_meta=files_meta, extracted_text=context,
+                    text_report=text_report, user_login=user_login,
+                )
+            except Exception as ce:
+                logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
 
         # Логирование usage
         uid = task.get("user_id", 0)
@@ -625,7 +791,10 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                 pass
 
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Не удаляем tmp_dir пока ждём решения пользователя по кэшу —
+        # файлы могут понадобиться для перезапуска через /decide.
+        if not tasks.get(task_id, {}).get("awaiting_decision"):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # -- Legacy pipeline (кастомный промпт) ------------------------------------
@@ -642,6 +811,11 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         if not valid:
             task.update(status="error", detail="Нет пригодных файлов.")
             return
+
+        # -- Шаг 1.5: Проверка кэша по номеру (skip если force_refresh) --
+        if not task.get("force_refresh"):
+            if await _try_cache_match(task_id, extracted, "short"):
+                return  # cached_exists — ждём /decide
 
         task.update(step="classifying", detail="Обработка документов...")
         docs = []
@@ -677,7 +851,7 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
                 "context_chars": context_chars,
                 "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta)}
 
-        purchase_number = extract_purchase_number(parsed)
+        purchase_number = task.get("purchase_number_prefetched") or extract_purchase_number(parsed)
         if purchase_number:
             logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
 
@@ -685,6 +859,25 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         task.update(status="done", results=parsed, parameters=parsed, risks=[],
                     warnings=[], meta=meta, text=text_report, context=context,
                     purchase_number=purchase_number, completed_at=time.time())
+
+        # Запись в кэш
+        if purchase_number:
+            try:
+                user_login = ""
+                uid = task.get("user_id", 0)
+                if uid:
+                    u = auth_module.get_user_by_id(uid)
+                    if u:
+                        user_login = u["login"]
+                cache_module.save_cache(
+                    purchase_number=purchase_number, mode="short",
+                    total_size_bytes=meta["total_size_bytes"],
+                    result={"results": parsed, "risks": [], "parameters": parsed, "warnings": []},
+                    files_meta=files_meta, extracted_text=context,
+                    text_report=text_report, user_login=user_login,
+                )
+            except Exception as ce:
+                logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
 
         # Логирование usage
         uid = task.get("user_id", 0)
@@ -712,7 +905,8 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         logger.error(f"[TASK {task_id[:8]}] Ошибка: {e}", exc_info=True)
         tasks[task_id].update(status="error", detail=str(e)[:200])
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if not tasks.get(task_id, {}).get("awaiting_decision"):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 async def process_task_legacy(task_id: str, saved_paths: list[Path], prompt_template: str, tmp_dir: Path):
@@ -897,7 +1091,14 @@ async def get_status(task_id: str):
             "text": task.get("text"),
             "meta": task.get("meta"),
             "purchase_number": task.get("purchase_number"),
-            "completed_at": completed_at_ts,  # unix timestamp (МСК на сервере)
+            "completed_at": completed_at_ts,
+            "from_cache": task.get("from_cache", False),
+        })
+    elif task["status"] == "cached_exists":
+        return JSONResponse({
+            "status": "cached_exists",
+            "purchase_number": task.get("purchase_number"),
+            "cached_info": task.get("cached_info"),
         })
     elif task["status"] == "error":
         return JSONResponse({
@@ -910,6 +1111,92 @@ async def get_status(task_id: str):
             "step": task.get("step", ""),
             "detail": task.get("detail", ""),
         })
+
+
+class DecideRequest(BaseModel):
+    use_cache: bool
+
+
+@app.post("/analyze/{task_id}/decide")
+async def decide(task_id: str, req: DecideRequest, request: Request):
+    """Решение пользователя по cached_exists: использовать кэш или повторить анализ."""
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if task.get("status") != "cached_exists":
+        raise HTTPException(status_code=400, detail="Задача не в состоянии cached_exists")
+
+    cached = task.get("_cached_data")
+    if not cached:
+        raise HTTPException(status_code=500, detail="Кэш-данные потеряны")
+
+    user = getattr(request.state, "user", None)
+    user_login = user["login"] if user else ""
+
+    if req.use_cache:
+        # Восстанавливаем done-состояние из кэша
+        try:
+            result_data = json.loads(cached["result_json"])
+            files_meta = json.loads(cached["files_meta_json"])
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Битый кэш: {e}")
+
+        meta = {
+            "files": files_meta,
+            "skipped": [{"name": f["name"], "reason": f.get("skip_reason", "")}
+                        for f in files_meta if f.get("status") == "skipped"],
+            "context_chars": len(cached.get("extracted_text", "")),
+            "total_size_bytes": cached.get("total_size_bytes", 0),
+        }
+
+        task.update(
+            status="done",
+            results=result_data.get("results", []),
+            risks=result_data.get("risks", []),
+            parameters=result_data.get("parameters", []),
+            warnings=result_data.get("warnings", []),
+            meta=meta,
+            text=cached.get("text_report", ""),
+            context=cached.get("extracted_text", ""),
+            purchase_number=cached["purchase_number"],
+            completed_at=cached.get("created_at"),  # дата отчёта = когда был сделан оригинал
+            from_cache=True,
+            awaiting_decision=False,
+        )
+        cache_module.increment_hit(cached["purchase_number"], user_login)
+        # Удаляем tmp_dir — он больше не нужен
+        tmp_dir_str = task.get("tmp_dir")
+        if tmp_dir_str:
+            shutil.rmtree(tmp_dir_str, ignore_errors=True)
+        logger.info(f"[TASK {task_id[:8]}] [CACHE] Отдан из кэша: №{cached['purchase_number']}")
+        return JSONResponse({"status": "done", "from_cache": True})
+
+    # use_cache=false → перезапуск полного анализа
+    tmp_dir_str = task.get("tmp_dir")
+    if not tmp_dir_str or not Path(tmp_dir_str).exists():
+        raise HTTPException(status_code=500, detail="Файлы потеряны, загрузите заново")
+
+    tmp_dir = Path(tmp_dir_str)
+    saved_paths = [p for p in tmp_dir.iterdir() if p.is_file()]
+    if not saved_paths:
+        raise HTTPException(status_code=500, detail="Файлы не найдены, загрузите заново")
+
+    # Сбрасываем cached_exists, ставим флаг force_refresh — pipeline пропустит кэш-проверку
+    task.update(
+        status="processing", step="extracting",
+        detail="Повторный анализ запущен...",
+        awaiting_decision=False, force_refresh=True,
+    )
+    task.pop("_cached_data", None)
+    task.pop("cached_info", None)
+
+    mode = task.get("mode", "full")
+    if mode == "short":
+        asyncio.create_task(process_task_short(task_id, saved_paths, tmp_dir))
+    else:
+        asyncio.create_task(process_task_v3(task_id, saved_paths, tmp_dir))
+    logger.info(f"[TASK {task_id[:8]}] [CACHE] Перезапуск (force_refresh), mode={mode}")
+    return JSONResponse({"status": "processing", "from_cache": False})
 
 
 @app.post("/api/analyze")
