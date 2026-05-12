@@ -438,15 +438,17 @@ async def _try_cache_match(task_id: str, extracted: list, mode: str) -> bool:
     # Логируем токены extract_number в usage_log
     uid = task.get("user_id", 0)
     if uid:
-        # ~prompt_tokens = len(prompt)/4 — мы тратим основной объём на чтение
-        auth_module.log_usage(uid, "extract_number", 0, len(notice_text) // 4, 10, "done")
+        auth_module.log_usage(uid, "extract_number", 0, len(notice_text) // 4, 10, "done",
+                             purchase_number=number)
 
     cached = cache_module.get_cache(number)
     if not cached:
         logger.info(f"[TASK {task_id[:8]}] [CACHE] В кэше нет — будет полный анализ")
         return False
 
-    new_size = sum(getattr(f, "size_bytes", 0) for f in extracted if not f.skipped)
+    # Размер для diff — то, что юзер реально загрузил (а не распакованные внутренности).
+    # Так при загрузке ZIP-архива второй раз сравнение покажет «совпадает».
+    new_size = task.get("upload_total_size", 0)
     cached_size = cached.get("total_size_bytes", 0)
 
     task.update(
@@ -699,11 +701,13 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
         logger.info(f"[TASK {task_id[:8]}] Итого: рисков={len(risks_result)}, параметров={len(params_result)}")
 
         files_meta = build_files_meta(docs, extracted)
+        # total_size_bytes — то, что прислал юзер (для diff), не сумма распакованных
+        upload_size = task.get("upload_total_size") or sum(fm["size_bytes"] for fm in files_meta)
         meta = {
             "files": files_meta,
             "skipped": skipped,  # для обратной совместимости со старым UI/Битрикс
             "context_chars": context_chars,
-            "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta),
+            "total_size_bytes": upload_size,
         }
         flat_results = risks_result + params_result
         # Предпочитаем номер, извлечённый отдельным LLM-запросом на pre-step.
@@ -751,7 +755,8 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
         if uid:
             tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in flat_results)
             auth_module.log_usage(uid, "full", task.get("files_count", 0),
-                                 context_chars // 4, tokens_out, "done")
+                                 context_chars // 4, tokens_out, "done",
+                                 purchase_number=purchase_number)
 
         # -- Callback --
         callback_url = task.get("callback_url")
@@ -846,10 +851,11 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         task.update(step="parsing", detail="Формирование отчёта...")
 
         files_meta = build_files_meta(docs, extracted)
+        upload_size = task.get("upload_total_size") or sum(fm["size_bytes"] for fm in files_meta)
         meta = {"files": files_meta,
                 "skipped": [{"name": f.name, "reason": f.skip_reason} for f in extracted if f.skipped],
                 "context_chars": context_chars,
-                "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta)}
+                "total_size_bytes": upload_size}
 
         purchase_number = task.get("purchase_number_prefetched") or extract_purchase_number(parsed)
         if purchase_number:
@@ -884,7 +890,8 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         if uid:
             tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in parsed)
             auth_module.log_usage(uid, "short", task.get("files_count", 0),
-                                 context_chars // 4, tokens_out, "done")
+                                 context_chars // 4, tokens_out, "done",
+                                 purchase_number=purchase_number)
 
         callback_url = task.get("callback_url")
         if callback_url:
@@ -942,9 +949,10 @@ async def process_task_legacy(task_id: str, saved_paths: list[Path], prompt_temp
             return
 
         files_meta_legacy = build_files_meta(docs, extracted)
+        upload_size = task.get("upload_total_size") or sum(fm["size_bytes"] for fm in files_meta_legacy)
         meta = {"files": files_meta_legacy,
                 "context_chars": context_chars,
-                "total_size_bytes": sum(fm["size_bytes"] for fm in files_meta_legacy)}
+                "total_size_bytes": upload_size}
 
         purchase_number = extract_purchase_number(parsed)
         if purchase_number:
@@ -1047,11 +1055,13 @@ async def analyze(
     # Сохраняем файлы
     tmp_dir = Path(tempfile.mkdtemp())
     saved_paths = []
+    upload_total_size = 0  # сумма ровно того, что прислал юзер (а не распакованных файлов)
     for upload in files:
         dest = tmp_dir / upload.filename
         content = await upload.read()
         dest.write_bytes(content)
         saved_paths.append(dest)
+        upload_total_size += len(content)
         logger.info(f"Получен: {upload.filename} ({len(content)} байт)")
 
     task_id = str(uuid.uuid4())
@@ -1059,6 +1069,7 @@ async def analyze(
         "status": "processing", "step": "uploading",
         "detail": "Файлы загружены...", "created": time.time(), "tmp_dir": str(tmp_dir),
         "user_id": user_id, "mode": mode, "files_count": len(saved_paths),
+        "upload_total_size": upload_total_size,
     }
 
     if custom_prompt:
@@ -1224,6 +1235,7 @@ async def api_analyze(req: ApiAnalyzeRequest, request: Request):
 
     tmp_dir = Path(tempfile.mkdtemp())
     saved_paths = []
+    upload_total_size = 0
 
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as dl:
@@ -1238,6 +1250,7 @@ async def api_analyze(req: ApiAnalyzeRequest, request: Request):
                 dest = tmp_dir / filename
                 dest.write_bytes(resp.content)
                 saved_paths.append(dest)
+                upload_total_size += len(resp.content)
                 logger.info(f"[API] Скачан: {filename} ({len(resp.content)} байт)")
     except Exception as e:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1254,6 +1267,7 @@ async def api_analyze(req: ApiAnalyzeRequest, request: Request):
         "tmp_dir": str(tmp_dir), "callback_url": req.callback_url,
         "user_id": user_id, "mode": req.mode, "files_count": len(saved_paths),
         "external_id": req.external_id,
+        "upload_total_size": upload_total_size,
     }
 
     if custom_prompt:
@@ -1429,6 +1443,60 @@ async def admin_reset_password(user_id: int, req: ResetPasswordRequest, request:
     return JSONResponse({"ok": True})
 
 
+# -- Admin API: кэш тендеров ---------------------------------------------
+
+@app.get("/admin/api/cache_list")
+async def admin_cache_list(request: Request):
+    """Список записей кэша (без тяжёлого extracted_text)."""
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    return JSONResponse(cache_module.get_all_cached())
+
+
+@app.get("/admin/api/cache_view/{purchase_number}")
+async def admin_cache_view(purchase_number: str, request: Request):
+    """Полный отчёт из кэша (text + files_meta) для просмотра."""
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    cached = cache_module.get_cache(purchase_number)
+    if not cached:
+        raise HTTPException(status_code=404, detail="Запись не найдена или истекла")
+    try:
+        result_data = json.loads(cached["result_json"])
+        files_meta = json.loads(cached["files_meta_json"])
+    except Exception:
+        result_data, files_meta = {}, []
+    return JSONResponse({
+        "purchase_number": cached["purchase_number"],
+        "mode": cached["mode"],
+        "created_at": cached["created_at"],
+        "expires_at": cached["expires_at"],
+        "total_size_bytes": cached["total_size_bytes"],
+        "user_login": cached.get("user_login"),
+        "user_login_last": cached.get("user_login_last"),
+        "hit_count": cached.get("hit_count", 0),
+        "last_accessed": cached.get("last_accessed"),
+        "text_report": cached.get("text_report", ""),
+        "files_meta": files_meta,
+        "results": result_data.get("results", []),
+        "risks": result_data.get("risks", []),
+        "parameters": result_data.get("parameters", []),
+    })
+
+
+@app.delete("/admin/api/cache_delete/{purchase_number}")
+async def admin_cache_delete(purchase_number: str, request: Request):
+    """Принудительная инвалидация записи кэша."""
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Доступ запрещён")
+    deleted = cache_module.delete_cache(purchase_number)
+    logger.info(f"[ADMIN] {user['login']} удалил кэш №{purchase_number}: existed={deleted}")
+    return JSONResponse({"ok": True, "deleted": deleted})
+
+
 # -- Refine: уточнение ответа по одному вопросу ---------------------------
 
 class RefineRequest(BaseModel):
@@ -1474,7 +1542,8 @@ async def refine(req: RefineRequest, request: Request):
     # Логирование usage
     if user_id:
         tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in parsed)
-        auth_module.log_usage(user_id, "refine", 0, len(context) // 4, tokens_out, "done")
+        auth_module.log_usage(user_id, "refine", 0, len(context) // 4, tokens_out, "done",
+                             purchase_number=task.get("purchase_number"))
 
     return JSONResponse({"item": parsed[0]})
 

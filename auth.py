@@ -66,6 +66,12 @@ def init_db():
         );
     """)
 
+    # Миграция: добавить purchase_number в usage_log если его нет
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(usage_log)").fetchall()]
+    if "purchase_number" not in cols:
+        conn.execute("ALTER TABLE usage_log ADD COLUMN purchase_number TEXT")
+        logger.info("[AUTH] Миграция: добавлен столбец usage_log.purchase_number")
+
     # Создаём admin если нет
     existing = conn.execute("SELECT id FROM users WHERE login = ?", ("Admin",)).fetchone()
     if not existing:
@@ -205,13 +211,14 @@ def check_daily_limit(user_id: int) -> tuple[bool, int, int]:
 # -- Логирование -----------------------------------------------------------
 
 def log_usage(user_id: int, mode: str, files_count: int,
-              tokens_in: int, tokens_out: int, status: str):
-    """Записывает использование."""
+              tokens_in: int, tokens_out: int, status: str,
+              purchase_number: str | None = None):
+    """Записывает использование. purchase_number — номер закупки, если известен."""
     conn = _get_db()
     conn.execute(
-        "INSERT INTO usage_log (user_id, timestamp, mode, files_count, tokens_in, tokens_out, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, datetime.now(MSK_TZ).isoformat(), mode, files_count, tokens_in, tokens_out, status),
+        "INSERT INTO usage_log (user_id, timestamp, mode, files_count, tokens_in, tokens_out, status, purchase_number) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, datetime.now(MSK_TZ).isoformat(), mode, files_count, tokens_in, tokens_out, status, purchase_number),
     )
     conn.commit()
     conn.close()
