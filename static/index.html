@@ -221,9 +221,10 @@ footer a { color:var(--primary); text-decoration:none; }
     <div class="steps">
       <div class="step pending" id="s1">Распаковка и инвентаризация файлов</div>
       <div class="step pending" id="s2">Извлечение текста из документов</div>
-      <div class="step pending" id="s3">Классификация и нарезка на разделы</div>
-      <div class="step pending" id="s4">Маршрутизация и сборка контекста</div>
-      <div class="step pending" id="s5">Запросы к модели (2 параллельных)</div>
+      <div class="step pending" id="sCache">Поиск номера закупки в извещении</div>
+      <div class="step pending" id="s3">Классификация документов</div>
+      <div class="step pending" id="s4">Сборка контекста для модели</div>
+      <div class="step pending" id="s5">Запросы к модели</div>
       <div class="step pending" id="s6">Формирование отчёта</div>
     </div>
   </div>
@@ -340,12 +341,14 @@ function setBadge(name, type) {
 }
 
 // ── Прогресс ─────────────────────────────────────────────
+const ALL_STEPS = ['s1','s2','sCache','s3','s4','s5','s6'];
+
 function setStep(id, state) {
   const el = document.getElementById(id);
   if (el) el.className = 'step ' + state;
 }
 function allSteps(state) {
-  ['s1','s2','s3','s4','s5','s6'].forEach(s => setStep(s, state));
+  ALL_STEPS.forEach(s => setStep(s, state));
 }
 
 // ── Метр контекста ────────────────────────────────────────
@@ -368,12 +371,13 @@ document.getElementById('clearBtn').addEventListener('click', clearAll);
 
 // Маппинг шагов сервера на элементы UI
 const STEP_MAP = {
-  uploading:   { active: 's1', done: [] },
-  extracting:  { active: 's2', done: ['s1'] },
-  classifying: { active: 's3', done: ['s1','s2'] },
-  context:     { active: 's4', done: ['s1','s2','s3'] },
-  api:         { active: 's5', done: ['s1','s2','s3','s4'] },
-  parsing:     { active: 's6', done: ['s1','s2','s3','s4','s5'] },
+  uploading:   { active: 's1',     done: [] },
+  extracting:  { active: 's2',     done: ['s1'] },
+  cache_check: { active: 'sCache', done: ['s1','s2'] },
+  classifying: { active: 's3',     done: ['s1','s2','sCache'] },
+  context:     { active: 's4',     done: ['s1','s2','sCache','s3'] },
+  api:         { active: 's5',     done: ['s1','s2','sCache','s3','s4'] },
+  parsing:     { active: 's6',     done: ['s1','s2','sCache','s3','s4','s5'] },
 };
 
 function applyStep(step) {
@@ -499,7 +503,7 @@ function finishAndRender(data) {
   }
   updateMeter(data.meta?.context_chars || 0, data.meta?.truncated || false);
   allSteps('pending');
-  ['s1','s2','s3','s4','s5','s6'].forEach(s => setStep(s, 'done'));
+  ALL_STEPS.forEach(s => setStep(s, 'done'));
 
   lastResults = data.results;
   lastMeta = data.meta;
