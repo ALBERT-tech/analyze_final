@@ -227,16 +227,23 @@ def extract_purchase_number(results: list) -> str | None:
                 if _is_valid_purchase_number(num):
                     return num
 
-        # Стратегия 2: длинные числа (типичные форматы площадок)
-        match = re.search(r"\b(\d{19}|\d{11}|\d{7,8})\b", answer)
+        # Стратегия 2: длинные числа с возможным буквенным префиксом
+        # (ЗП605694, Lot12345). Префикс ≤5 букв, идёт слитно с цифрами.
+        match = re.search(
+            r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,5})?(\d{19}|\d{11}|\d{7,8})(?!\d)",
+            answer,
+        )
         if match:
-            return match.group(1)
+            return (match.group(1) or "") + match.group(2)
 
-        # Стратегия 3: расширенный fallback — первое 4+ значное число (кроме годов)
-        for match in re.finditer(r"\b(\d{4,19})\b", answer):
-            num = match.group(1)
+        # Стратегия 3: расширенный fallback — 4+ цифр (с возможным префиксом), кроме годов
+        for match in re.finditer(
+            r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,5})?(\d{4,19})(?!\d)",
+            answer,
+        ):
+            num = match.group(2)
             if _is_valid_purchase_number(num):
-                return num
+                return (match.group(1) or "") + num
     return None
 
 
@@ -402,9 +409,13 @@ async def extract_number_via_llm(notice_text: str, task_id: str) -> str | None:
     if text.upper() == "NONE" or "не найден" in text.lower():
         return None
 
-    match = re.search(r"\b(\d{3,19})\b", text)
-    if match and _is_valid_purchase_number(match.group(1)):
-        return match.group(1)
+    # Поддерживаем буквенно-цифровые номера (ЗП605694 на ТЭК-Торге, Lot12345).
+    # Группа 1 — необязательный префикс из 1-5 букв (кириллица или латиница).
+    # Группа 2 — цифры (3-19). Префикс должен примыкать к цифрам без пробела.
+    match = re.search(r"(?<![A-Za-zА-Яа-яЁё0-9])([A-Za-zА-Яа-яЁё]{1,5})?(\d{3,19})(?!\d)", text)
+    if match and _is_valid_purchase_number(match.group(2)):
+        prefix = match.group(1) or ""
+        return prefix + match.group(2)
     return None
 
 
@@ -715,6 +726,9 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
         purchase_number = task.get("purchase_number_prefetched") or extract_purchase_number(flat_results)
         if purchase_number:
             logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
+        # Псевдо-ключ для записей БЕЗ номера — чтобы отчёт всё равно был
+        # доступен из админки (юзер кликает «нет номера» и видит этот отчёт).
+        cache_key = purchase_number or f"no-{task_id[:8]}"
         text_report = format_report(risks_result, params_result, warnings, meta)
 
         task.update(
@@ -730,33 +744,34 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
             completed_at=time.time(),
         )
 
-        # Запись в кэш (только если номер известен)
-        if purchase_number:
-            try:
-                user_login = ""
-                uid = task.get("user_id", 0)
-                if uid:
-                    u = auth_module.get_user_by_id(uid)
-                    if u:
-                        user_login = u["login"]
-                cache_module.save_cache(
-                    purchase_number=purchase_number, mode="full",
-                    total_size_bytes=meta["total_size_bytes"],
-                    result={"results": flat_results, "risks": risks_result,
-                            "parameters": params_result, "warnings": warnings},
-                    files_meta=files_meta, extracted_text=context,
-                    text_report=text_report, user_login=user_login,
-                )
-            except Exception as ce:
-                logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
+        # Запись в кэш — ВСЕГДА. Если номер не определён, используем псевдо-ключ
+        # no-{task_id[:8]} чтобы отчёт всё равно был доступен через админку.
+        try:
+            user_login = ""
+            uid = task.get("user_id", 0)
+            if uid:
+                u = auth_module.get_user_by_id(uid)
+                if u:
+                    user_login = u["login"]
+            cache_module.save_cache(
+                purchase_number=cache_key, mode="full",
+                total_size_bytes=meta["total_size_bytes"],
+                result={"results": flat_results, "risks": risks_result,
+                        "parameters": params_result, "warnings": warnings},
+                files_meta=files_meta, extracted_text=context,
+                text_report=text_report, user_login=user_login,
+            )
+        except Exception as ce:
+            logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
 
-        # Логирование usage
+        # Логирование usage — пишем cache_key (реальный номер ИЛИ no-XXX),
+        # чтобы клик из логов всегда находил отчёт.
         uid = task.get("user_id", 0)
         if uid:
             tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in flat_results)
             auth_module.log_usage(uid, "full", task.get("files_count", 0),
                                  context_chars // 4, tokens_out, "done",
-                                 purchase_number=purchase_number)
+                                 purchase_number=cache_key)
 
         # -- Callback --
         callback_url = task.get("callback_url")
@@ -860,38 +875,38 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
         purchase_number = task.get("purchase_number_prefetched") or extract_purchase_number(parsed)
         if purchase_number:
             logger.info(f"[TASK {task_id[:8]}] Номер закупки: {purchase_number}")
+        cache_key = purchase_number or f"no-{task_id[:8]}"
 
         text_report = format_report([], parsed, [], meta)
         task.update(status="done", results=parsed, parameters=parsed, risks=[],
                     warnings=[], meta=meta, text=text_report, context=context,
                     purchase_number=purchase_number, completed_at=time.time())
 
-        # Запись в кэш
-        if purchase_number:
-            try:
-                user_login = ""
-                uid = task.get("user_id", 0)
-                if uid:
-                    u = auth_module.get_user_by_id(uid)
-                    if u:
-                        user_login = u["login"]
-                cache_module.save_cache(
-                    purchase_number=purchase_number, mode="short",
-                    total_size_bytes=meta["total_size_bytes"],
-                    result={"results": parsed, "risks": [], "parameters": parsed, "warnings": []},
-                    files_meta=files_meta, extracted_text=context,
-                    text_report=text_report, user_login=user_login,
-                )
-            except Exception as ce:
-                logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
+        # Запись в кэш — ВСЕГДА (даже без номера, с псевдо-ключом)
+        try:
+            user_login = ""
+            uid = task.get("user_id", 0)
+            if uid:
+                u = auth_module.get_user_by_id(uid)
+                if u:
+                    user_login = u["login"]
+            cache_module.save_cache(
+                purchase_number=cache_key, mode="short",
+                total_size_bytes=meta["total_size_bytes"],
+                result={"results": parsed, "risks": [], "parameters": parsed, "warnings": []},
+                files_meta=files_meta, extracted_text=context,
+                text_report=text_report, user_login=user_login,
+            )
+        except Exception as ce:
+            logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
 
-        # Логирование usage
+        # Логирование usage — пишем cache_key чтобы из админки клик находил отчёт
         uid = task.get("user_id", 0)
         if uid:
             tokens_out = sum(len(json.dumps(r, ensure_ascii=False)) // 4 for r in parsed)
             auth_module.log_usage(uid, "short", task.get("files_count", 0),
                                  context_chars // 4, tokens_out, "done",
-                                 purchase_number=purchase_number)
+                                 purchase_number=cache_key)
 
         callback_url = task.get("callback_url")
         if callback_url:

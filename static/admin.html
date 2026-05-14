@@ -223,13 +223,21 @@ async function toggleDetail(userId) {
   logs.forEach(l => {
     const d = new Date(l.timestamp);
     const ds = d.toLocaleDateString('ru') + ' ' + d.toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit'});
-    const pn = l.purchase_number
-      ? `<span class="purchase-link" onclick="viewCache('${l.purchase_number}')" title="Посмотреть отчёт">${l.purchase_number}</span>`
-      : '<span style="color:var(--text2)">—</span>';
+    const pn = renderPurchaseCell(l.purchase_number);
     html += `<tr><td>${ds}</td><td>${l.mode||'-'}</td><td>${pn}</td><td>${l.files_count}</td><td class="token-num">${fmt(l.tokens_in)}</td><td class="token-num">${fmt(l.tokens_out)}</td><td>${l.status}</td></tr>`;
   });
   html += '</tbody></table>';
   div.innerHTML = html;
+}
+
+// Рендер ячейки «Закупка №» — реальный номер, "нет номера" (кликабельно)
+// для no-XXX псевдо-ключей, или прочерк для NULL (старые записи до миграции).
+function renderPurchaseCell(pn) {
+  if (!pn) return '<span style="color:var(--text2)" title="Анализ сделан до того, как мы стали сохранять отчёты">—</span>';
+  if (pn.startsWith('no-')) {
+    return `<span class="purchase-link" onclick="viewCache('${pn}')" title="Посмотреть отчёт (номер закупки не определился)" style="font-style:italic;">нет номера</span>`;
+  }
+  return `<span class="purchase-link" onclick="viewCache('${pn}')" title="Посмотреть отчёт">${pn}</span>`;
 }
 
 // ── Кэш тендеров ──────────────────────────────────────────
@@ -272,7 +280,7 @@ async function loadCache() {
   items.forEach(c => {
     const tr = document.createElement('tr');
     tr.innerHTML = `
-      <td><span class="purchase-link" onclick="viewCache('${c.purchase_number}')" title="Посмотреть отчёт">${c.purchase_number}</span></td>
+      <td>${renderPurchaseCell(c.purchase_number)}</td>
       <td>${modeLabel(c.mode)}</td>
       <td title="${fmtDate(c.created_at)}">${fmtDate(c.created_at)}</td>
       <td>${fmtDaysLeft(c.expires_at)}</td>
@@ -296,7 +304,8 @@ async function viewCache(purchaseNumber) {
     return;
   }
   const d = await r.json();
-  document.getElementById('cvNumber').textContent = d.purchase_number;
+  const isNoNum = d.purchase_number && d.purchase_number.startsWith('no-');
+  document.getElementById('cvNumber').textContent = isNoNum ? '— (номер не определён)' : d.purchase_number;
   document.getElementById('cvMeta').innerHTML =
     `режим <b>${modeLabel(d.mode)}</b> · создан ${fmtDate(d.created_at)} ` +
     `· истекает ${fmtDate(d.expires_at)} (${fmtDaysLeft(d.expires_at)}) ` +
