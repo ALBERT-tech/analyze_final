@@ -1,7 +1,7 @@
 """
 pipeline/extractor.py
 
-Шаг 1 - Распаковка и инвентаризация
+Шаг 1 - Распаковка и инвентаризация (поддерживаемые архивы: ZIP, 7Z, RAR)
 Шаг 2 - Извлечение текста:
          PDF     - pymupdf4llm (Markdown)
          DOCX    - python-docx (параграфы + таблицы)
@@ -10,8 +10,9 @@ pipeline/extractor.py
          XLSX    - openpyxl
          XLS     - xlrd
          DOC     - antiword (системная утилита)
+         RTF     - striprtf
 
-Поддерживает: PDF, DOCX, DOC, HTML, TXT, XLSX, XLS, ZIP (включая вложенные).
+Архивы распаковываются рекурсивно (ZIP внутри 7Z и т.п.), глубина до 3.
 """
 
 import zipfile
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 SKIP_EXTENSIONS = {".pptx", ".xlsb", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
 
-MAX_ZIP_DEPTH = 3
+MAX_ARCHIVE_DEPTH = 3
 
 
 @dataclass
@@ -41,54 +42,91 @@ class ExtractedFile:
     size_bytes: int = 0
 
 
-# -- ZIP ------------------------------------------------------------------
+# -- Архивы (ZIP / 7Z / RAR) ----------------------------------------------
 
 def _fix_zip_filename(name: str) -> str:
     """Исправляет кодировку имён файлов в ZIP (CP437 -> CP866 для кириллицы)."""
     try:
-        # Если имя содержит нечитаемые символы — скорее всего CP437, пробуем CP866
         if any(ord(c) > 127 for c in name):
             fixed = name.encode("cp437").decode("cp866")
-            if any("\u0400" <= c <= "\u04FF" for c in fixed):  # Есть кириллица
+            # Есть ли в результате символы кириллицы (диапазон U+0400 .. U+04FF)?
+            if any("Ѐ" <= c <= "ӿ" for c in fixed):
                 return fixed
     except (UnicodeDecodeError, UnicodeEncodeError):
         pass
     return name
 
 
-def _unpack_zip(zip_path: Path, target_dir: Path, depth: int = 0) -> list[Path]:
-    """Рекурсивно распаковывает ZIP, возвращает список путей к файлам."""
-    if depth > MAX_ZIP_DEPTH:
-        logger.warning(f"[ZIP] Превышена глубина вложенности: {zip_path}")
-        return []
-
-    found = []
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for info in zf.infolist():
-                # Исправляем кодировку имени
-                fixed_name = _fix_zip_filename(info.filename)
-                # Извлекаем файл
-                data = zf.read(info.filename)
-                dest = target_dir / fixed_name
-                if info.is_dir():
-                    dest.mkdir(parents=True, exist_ok=True)
-                else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(data)
-        logger.info(f"[ZIP] Распакован: {zip_path.name}")
-    except zipfile.BadZipFile:
-        logger.warning(f"[ZIP] Битый архив: {zip_path}")
-        return []
-
-    for item in target_dir.rglob("*"):
-        if item.is_file():
-            if item.suffix.lower() == ".zip":
-                nested_dir = item.parent / (item.stem + "_extracted")
-                nested_dir.mkdir(exist_ok=True)
-                found.extend(_unpack_zip(item, nested_dir, depth + 1))
+def _unpack_zip_inner(arch_path: Path, target_dir: Path):
+    """Чистая распаковка ZIP (без рекурсии). С фиксом кириллических имён."""
+    with zipfile.ZipFile(arch_path, "r") as zf:
+        for info in zf.infolist():
+            fixed_name = _fix_zip_filename(info.filename)
+            data = zf.read(info.filename)
+            dest = target_dir / fixed_name
+            if info.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
             else:
-                found.append(item)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+
+
+def _unpack_7z_inner(arch_path: Path, target_dir: Path):
+    """Распаковка 7Z через py7zr (чистый Python, без системных утилит)."""
+    import py7zr
+    with py7zr.SevenZipFile(str(arch_path), mode="r") as z:
+        z.extractall(path=str(target_dir))
+
+
+def _unpack_rar_inner(arch_path: Path, target_dir: Path):
+    """Распаковка RAR через unar (свободная утилита, ставится apt-ом)."""
+    import rarfile
+    rarfile.UNRAR_TOOL = "unar"
+    with rarfile.RarFile(str(arch_path)) as rf:
+        rf.extractall(path=str(target_dir))
+
+
+# Маппинг расширения -> функция-распаковщик. Новые форматы — одной строкой.
+ARCHIVE_HANDLERS = {
+    ".zip": _unpack_zip_inner,
+    ".7z":  _unpack_7z_inner,
+    ".rar": _unpack_rar_inner,
+}
+
+
+def _unpack_archive(arch_path: Path, target_dir: Path, depth: int = 0) -> list[Path]:
+    """Распаковывает архив (ZIP/7Z/RAR) в target_dir. Рекурсивно обрабатывает
+    вложенные архивы до глубины MAX_ARCHIVE_DEPTH. Возвращает плоский список
+    путей к нераспаковываемым файлам (то есть к фактическим документам).
+    """
+    if depth > MAX_ARCHIVE_DEPTH:
+        logger.warning(f"[ARCH] Превышена глубина вложенности: {arch_path.name}")
+        return []
+
+    ext = arch_path.suffix.lower()
+    handler = ARCHIVE_HANDLERS.get(ext)
+    if not handler:
+        return []
+
+    label = ext.upper().lstrip(".")
+    try:
+        handler(arch_path, target_dir)
+        logger.info(f"[{label}] Распакован: {arch_path.name}")
+    except Exception as e:
+        logger.warning(f"[{label}] Не удалось распаковать {arch_path.name}: {e}")
+        return []
+
+    found: list[Path] = []
+    for item in target_dir.rglob("*"):
+        if not item.is_file():
+            continue
+        sub_ext = item.suffix.lower()
+        if sub_ext in ARCHIVE_HANDLERS:
+            nested_dir = item.parent / (item.stem + "_extracted")
+            nested_dir.mkdir(exist_ok=True)
+            found.extend(_unpack_archive(item, nested_dir, depth + 1))
+        else:
+            found.append(item)
     return found
 
 
@@ -231,8 +269,8 @@ FORMAT_HANDLERS = {
 
 def extract_files(uploaded_paths: list[Path]) -> list[ExtractedFile]:
     """
-    Принимает список путей к загруженным файлам (могут быть ZIP).
-    Возвращает список ExtractedFile с текстом.
+    Принимает список путей к загруженным файлам (могут быть архивы).
+    Возвращает список ExtractedFile с текстом или пометкой skipped.
     """
     results: list[ExtractedFile] = []
     all_files: list[Path] = []
@@ -241,12 +279,13 @@ def extract_files(uploaded_paths: list[Path]) -> list[ExtractedFile]:
     # --- Шаг 1: инвентаризация ---
     for path in uploaded_paths:
         ext = path.suffix.lower()
-        if ext == ".zip":
+        if ext in ARCHIVE_HANDLERS:
             tmp_dir = Path(tempfile.mkdtemp())
             tmp_dirs.append(tmp_dir)
-            unpacked = _unpack_zip(path, tmp_dir)
+            unpacked = _unpack_archive(path, tmp_dir)
             all_files.extend(unpacked)
-            logger.info(f"[ИНВЕНТАРИЗАЦИЯ] ZIP {path.name}: {len(unpacked)} файлов")
+            label = ext.upper().lstrip(".")
+            logger.info(f"[ИНВЕНТАРИЗАЦИЯ] {label} {path.name}: {len(unpacked)} файлов")
         else:
             all_files.append(path)
 
