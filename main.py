@@ -52,6 +52,17 @@ FALLBACK_MODEL      = os.getenv("FALLBACK_MODEL", "gemini/gemini-2.0-flash")
 MAX_TOKENS_PER_CALL = int(os.getenv("MAX_TOKENS_PER_CALL", "12000"))
 MAX_CONTEXT_CHARS   = int(os.getenv("MAX_CONTEXT_CHARS", "500000"))
 
+# Retry основного провайдера. agentplatform балансирует запросы между upstream-
+# серверами, часть которых периодически нездорова (напр. протухший SSL на
+# aiproxy.agentplatform.ru → мгновенный 500/0). Повтор обычно попадает на
+# здоровый сервер. Ошибка приходит за ~35мс, так что повторы дешёвые.
+MAIN_MAX_ATTEMPTS = int(os.getenv("MAIN_MAX_ATTEMPTS", "3"))
+RETRY_DELAY       = float(os.getenv("RETRY_DELAY", "1.0"))
+# Статусы, при которых имеет смысл повторить/уйти в резерв (временные сбои).
+# 404 — провайдер снял модель из эндпоинтов; 500 — SSL/connect к upstream.
+# 401/400 сюда НЕ входят (это наша ошибка — ключ/запрос — повтор не поможет).
+RETRY_STATUSES = (0, 404, 429, 500, 502, 503, 504)
+
 DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
 SESSION_SECRET      = os.getenv("SESSION_SECRET", "tender-analyzer-secret-key-change-me")
 
@@ -341,15 +352,29 @@ async def _try_api(url: str, key: str, model: str, prompt_text: str,
 
 
 async def call_api(prompt_text: str, task_id: str, label: str) -> list | None:
-    """Вызов LLM API с fallback при 429. Отмечает в tasks[task_id] использование резерва."""
+    """Вызов LLM API с retry основного провайдера и fallback на резервный.
+
+    1) До MAIN_MAX_ATTEMPTS попыток к основному провайдеру (лечит «через раз»
+       из-за больного upstream-сервера у agentplatform).
+    2) Если все попытки исчерпаны и статус временный — уходим на резерв.
+    """
     logger.info(f"[TASK {task_id[:8]}] [{label}] Отправка ({len(prompt_text)} симв.)")
 
-    # Попытка 1: основной провайдер
-    parsed, status = await _try_api(API_URL, API_KEY, MODEL, prompt_text, task_id, label, "MAIN")
+    parsed, status = None, 0
+    for attempt in range(1, MAIN_MAX_ATTEMPTS + 1):
+        parsed, status = await _try_api(API_URL, API_KEY, MODEL, prompt_text, task_id, label, "MAIN")
+        if parsed is not None:
+            return parsed
+        # status=200 с parsed=None — модель вернула нераспарсиваемый ответ, повтор не поможет
+        if status not in RETRY_STATUSES:
+            break
+        if attempt < MAIN_MAX_ATTEMPTS:
+            logger.warning(f"[TASK {task_id[:8]}] [{label}] MAIN попытка {attempt}/{MAIN_MAX_ATTEMPTS} неудачна ({status}), повтор через {RETRY_DELAY}с")
+            await asyncio.sleep(RETRY_DELAY)
 
-    # Fallback при 429 или сетевой ошибке
-    if parsed is None and status in (0, 429, 502, 503, 504) and FALLBACK_API_KEY:
-        logger.warning(f"[TASK {task_id[:8]}] [{label}] Основной провайдер недоступен ({status}), переключаюсь на резервный")
+    # Fallback на резервный провайдер
+    if parsed is None and status in RETRY_STATUSES and FALLBACK_API_KEY:
+        logger.warning(f"[TASK {task_id[:8]}] [{label}] MAIN недоступен после {MAIN_MAX_ATTEMPTS} попыток ({status}), переключаюсь на резерв")
         parsed, status = await _try_api(FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL,
                                         prompt_text, task_id, label, "FALLBACK")
         if parsed and task_id in tasks:
@@ -401,10 +426,20 @@ async def extract_number_via_llm(notice_text: str, task_id: str) -> str | None:
         return None
 
     logger.info(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] Отправка ({len(prompt)} симв.)")
-    raw, status = await _try_api_raw_text(API_URL, API_KEY, MODEL, prompt, task_id, "EXTRACT_NUMBER", "MAIN")
 
-    if raw is None and status in (0, 429, 502, 503, 504) and FALLBACK_API_KEY:
-        logger.warning(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] Основной {status} — fallback")
+    raw, status = None, 0
+    for attempt in range(1, MAIN_MAX_ATTEMPTS + 1):
+        raw, status = await _try_api_raw_text(API_URL, API_KEY, MODEL, prompt, task_id, "EXTRACT_NUMBER", "MAIN")
+        if raw is not None:
+            break
+        if status not in RETRY_STATUSES:
+            break
+        if attempt < MAIN_MAX_ATTEMPTS:
+            logger.warning(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] MAIN попытка {attempt}/{MAIN_MAX_ATTEMPTS} неудачна ({status}), повтор через {RETRY_DELAY}с")
+            await asyncio.sleep(RETRY_DELAY)
+
+    if raw is None and status in RETRY_STATUSES and FALLBACK_API_KEY:
+        logger.warning(f"[TASK {task_id[:8]}] [EXTRACT_NUMBER] MAIN недоступен после {MAIN_MAX_ATTEMPTS} попыток ({status}) — fallback")
         raw, status = await _try_api_raw_text(FALLBACK_API_URL, FALLBACK_API_KEY, FALLBACK_MODEL,
                                               prompt, task_id, "EXTRACT_NUMBER", "FALLBACK")
 
