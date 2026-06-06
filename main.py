@@ -1170,6 +1170,7 @@ async def analyze(
     files: list[UploadFile] = File(...),
     prompt: str = Form(None),
     mode: str = Form("full"),
+    purchase_number: str = Form(None),
 ):
     if not files:
         raise HTTPException(status_code=400, detail="Файлы не переданы")
@@ -1206,12 +1207,20 @@ async def analyze(
         upload_total_size += len(content)
         logger.info(f"Получен: {upload.filename} ({len(content)} байт)")
 
+    # Номер закупки от программного клиента (Saby-интеграция качает файлы у себя
+    # с сессией и заливает multipart'ом, т.к. trade.sbis.ru требует авторизацию).
+    # Если номер передан — это headless-вызов: модель для извлечения номера НЕ
+    # нужна, и кэш решается автоматически по размеру (is_api=True), без UI-диалога.
+    prefetched_number = (purchase_number or "").strip() or None
+
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
         "status": "processing", "step": "uploading",
         "detail": "Файлы загружены...", "created": time.time(), "tmp_dir": str(tmp_dir),
         "user_id": user_id, "mode": mode, "files_count": len(saved_paths),
         "upload_total_size": upload_total_size,
+        "purchase_number_prefetched": prefetched_number,
+        "is_api": prefetched_number is not None,
     }
 
     if custom_prompt:
