@@ -21,9 +21,15 @@ COPY . .
 # Проверяем что pipeline пакет на месте
 RUN python -c "from pipeline.classifier import classify; print('pipeline OK')"
 
-# Папка для SQLite БД (монтируется как volume)
-RUN mkdir -p /app/data
+# Непривилегированный пользователь (security-аудит H6): приложение принимает
+# произвольные файлы/архивы — нельзя крутить парсеры от root.
+# uid 10001 фиксирован, чтобы совпадать с владельцем тома /opt/analyze_final/data на хосте.
+RUN useradd -m -u 10001 appuser && mkdir -p /app/data && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8000
 
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# --proxy-headers + --forwarded-allow-ips "*" — доверяем X-Forwarded-For от nginx
+# (порт контейнера слушает только 127.0.0.1, снаружи недоступен), чтобы
+# rate-limit логина работал по реальному IP клиента, а не по адресу nginx.
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips "*"

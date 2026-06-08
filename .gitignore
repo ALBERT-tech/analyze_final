@@ -38,3 +38,15 @@ logs/
 
 # Railway / Render
 .railway/
+
+# секреты и БД (security-аудит)
+.env
+.env.*
+*.env.bak
+env.backup
+data/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc

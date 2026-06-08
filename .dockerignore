@@ -1,0 +1,22 @@
+# Секреты и локальные данные — не должны попадать в образ
+.env
+.env.*
+*.env.bak
+env.backup
+
+# БД и тома
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Git и кэши
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Прочее
+*.log
+.DS_Store
