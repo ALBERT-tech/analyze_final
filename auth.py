@@ -72,11 +72,19 @@ def init_db():
         conn.execute("ALTER TABLE usage_log ADD COLUMN purchase_number TEXT")
         logger.info("[AUTH] Миграция: добавлен столбец usage_log.purchase_number")
 
-    # Создаём admin если нет
-    existing = conn.execute("SELECT id FROM users WHERE login = ?", ("Admin",)).fetchone()
-    if not existing:
-        create_user(conn, "Admin", "AdmPass12=", role="admin")
-        logger.info("[AUTH] Создан admin-пользователь: Admin")
+    # Первичный админ — ТОЛЬКО если в системе нет ни одного админа.
+    # Пароль НЕ хардкодим (раньше тут был Admin/AdmPass12= — убрано как critical):
+    # берём из env ADMIN_INITIAL_PASSWORD либо генерируем случайный и пишем в лог один раз.
+    existing_admin = conn.execute("SELECT id FROM users WHERE role = 'admin'").fetchone()
+    if not existing_admin:
+        import secrets as _secrets
+        boot_login = os.getenv("ADMIN_INITIAL_LOGIN", "admin")
+        boot_pw = os.getenv("ADMIN_INITIAL_PASSWORD") or _secrets.token_urlsafe(12)
+        create_user(conn, boot_login, boot_pw, role="admin")
+        logger.warning(
+            f"[AUTH] Создан первичный админ '{boot_login}'. Пароль: {boot_pw} "
+            f"— войдите и смените через /profile!"
+        )
 
     conn.close()
 

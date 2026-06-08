@@ -19,7 +19,11 @@ import tempfile
 import shutil
 import time
 import uuid
+import socket
+import ipaddress
+import os.path
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Response, Cookie
@@ -63,6 +67,55 @@ RETRY_DELAY       = float(os.getenv("RETRY_DELAY", "1.0"))
 # 401/400 сюда НЕ входят (это наша ошибка — ключ/запрос — повтор не поможет).
 RETRY_STATUSES = (0, 404, 429, 500, 502, 503, 504)
 
+# Лимиты на скачивание/распаковку (anti-DoS, см. security-аудит)
+MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(60 * 1024 * 1024)))   # 60 МБ на файл
+PURCHASE_NUMBER_RE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9._\-/]{1,40}$")
+
+
+def is_safe_outbound_url(url: str) -> tuple[bool, str]:
+    """Защита от SSRF: разрешены только http/https и хосты, НЕ резолвящиеся в
+    приватные/loopback/link-local/reserved адреса. Возвращает (ok, причина_отказа)."""
+    try:
+        parts = urlsplit((url or "").strip())
+    except Exception:
+        return False, "не удалось разобрать URL"
+    if parts.scheme not in ("http", "https"):
+        return False, f"схема '{parts.scheme}' запрещена (только http/https)"
+    host = parts.hostname
+    if not host:
+        return False, "пустой хост"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return False, f"не удалось зарезолвить хост ({e})"
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False, f"некорректный IP {ip_str}"
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False, f"хост резолвится во внутренний адрес {ip_str}"
+    return True, ""
+
+
+def safe_filename(name: str, fallback: str = "file") -> str:
+    """Возвращает безопасное имя файла без компонентов пути (защита от path traversal)."""
+    base = os.path.basename((name or "").replace("\\", "/").strip())
+    if not base or base in (".", "..") or base.startswith("/"):
+        return fallback
+    return base
+
+
+def sanitize_purchase_number(raw: str | None) -> str | None:
+    """Валидирует номер закупки от клиента (защита от хранимого XSS в админке).
+    Разрешены буквы/цифры/.-_/ длиной до 40. Иначе — None (номер не используется)."""
+    v = (raw or "").strip()
+    if not v:
+        return None
+    return v if PURCHASE_NUMBER_RE.match(v) else None
+
 DEFAULT_PROMPT_PATH = Path("prompts/default.txt")
 SESSION_SECRET      = os.getenv("SESSION_SECRET", "tender-analyzer-secret-key-change-me")
 
@@ -95,14 +148,24 @@ def cleanup_old_tasks():
 
 
 # -- FastAPI ---------------------------------------------------------------
-app = FastAPI(title="Анализатор тендерной документации v3")
+# Swagger/OpenAPI выключены в проде (раскрывали карту API без авторизации).
+# Включить для отладки: ENABLE_DOCS=1 в .env.
+_docs_on = os.getenv("ENABLE_DOCS", "") == "1"
+app = FastAPI(
+    title="Анализатор тендерной документации v3",
+    docs_url="/docs" if _docs_on else None,
+    redoc_url="/redoc" if _docs_on else None,
+    openapi_url="/openapi.json" if _docs_on else None,
+)
 
 # Инициализация БД
 auth_module.init_db()
 cache_module.init_db()
 
 # Пути без авторизации
-PUBLIC_PATHS = {"/auth/login", "/health", "/openapi.json", "/docs", "/favicon.ico"}
+PUBLIC_PATHS = {"/auth/login", "/health", "/favicon.ico"}
+if _docs_on:
+    PUBLIC_PATHS |= {"/openapi.json", "/docs", "/redoc"}
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -1199,19 +1262,21 @@ async def analyze(
     tmp_dir = Path(tempfile.mkdtemp())
     saved_paths = []
     upload_total_size = 0  # сумма ровно того, что прислал юзер (а не распакованных файлов)
-    for upload in files:
-        dest = tmp_dir / upload.filename
+    for idx, upload in enumerate(files):
+        # safe_filename — защита от path traversal через имя файла (../../app/main.py)
+        fname = safe_filename(upload.filename, f"file_{idx}")
+        dest = tmp_dir / fname
         content = await upload.read()
         dest.write_bytes(content)
         saved_paths.append(dest)
         upload_total_size += len(content)
-        logger.info(f"Получен: {upload.filename} ({len(content)} байт)")
+        logger.info(f"Получен: {fname} ({len(content)} байт)")
 
     # Номер закупки от программного клиента (Saby-интеграция качает файлы у себя
     # с сессией и заливает multipart'ом, т.к. trade.sbis.ru требует авторизацию).
     # Если номер передан — это headless-вызов: модель для извлечения номера НЕ
     # нужна, и кэш решается автоматически по размеру (is_api=True), без UI-диалога.
-    prefetched_number = (purchase_number or "").strip() or None
+    prefetched_number = sanitize_purchase_number(purchase_number)
 
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
@@ -1236,10 +1301,26 @@ async def analyze(
     return JSONResponse({"task_id": task_id})
 
 
+def _check_task_owner(task: dict, request: Request) -> bool:
+    """True, если текущий пользователь — владелец задачи или админ.
+    Защита от IDOR: чужие отчёты по task_id (UUID) читать нельзя."""
+    user = getattr(request.state, "user", None)
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    owner = task.get("user_id")
+    # owner=0/None — задача без владельца (легаси): доступ только админу (выше)
+    return bool(owner) and owner == user.get("id")
+
+
 @app.get("/status/{task_id}")
-async def get_status(task_id: str):
+async def get_status(task_id: str, request: Request):
     task = tasks.get(task_id)
     if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if not _check_task_owner(task, request):
+        # 404 (не 403) — не раскрываем существование чужой задачи
         raise HTTPException(status_code=404, detail="Задача не найдена")
 
     if task["status"] == "done":
@@ -1284,6 +1365,8 @@ async def decide(task_id: str, req: DecideRequest, request: Request):
     """Решение пользователя по cached_exists: использовать кэш или повторить анализ."""
     task = tasks.get(task_id)
     if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    if not _check_task_owner(task, request):
         raise HTTPException(status_code=404, detail="Задача не найдена")
     if task.get("status") != "cached_exists":
         raise HTTPException(status_code=400, detail="Задача не в состоянии cached_exists")
@@ -1363,31 +1446,51 @@ async def api_analyze(req: ApiAnalyzeRequest, request: Request):
     upload_total_size = 0
 
     try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as dl:
-            for url in req.files:
+        # follow_redirects=False — иначе внешний 302 обходит SSRF-проверку исходного URL
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as dl:
+            for idx, url in enumerate(req.files):
+                ok, reason = is_safe_outbound_url(url)
+                if not ok:
+                    logger.warning(f"[API] URL отклонён (SSRF-защита): {url[:80]} — {reason}")
+                    continue
                 try:
                     resp = await dl.get(url)
+                    if resp.is_redirect:
+                        logger.warning(f"[API] Редирект отклонён (SSRF-защита): {url[:80]}")
+                        continue
                     resp.raise_for_status()
                 except Exception as e:
-                    logger.error(f"[API] Скачивание {url}: {e}")
+                    logger.error(f"[API] Скачивание {url[:80]}: {e}")
                     continue
-                filename = url.split("/")[-1].split("?")[0] or f"file_{len(saved_paths)}"
+                content = resp.content
+                if len(content) > MAX_DOWNLOAD_BYTES:
+                    logger.warning(f"[API] Файл превышает лимит {MAX_DOWNLOAD_BYTES} байт: {url[:80]}")
+                    continue
+                filename = safe_filename(url.split("?")[0].split("/")[-1], f"file_{idx}")
                 dest = tmp_dir / filename
-                dest.write_bytes(resp.content)
+                dest.write_bytes(content)
                 saved_paths.append(dest)
-                upload_total_size += len(resp.content)
-                logger.info(f"[API] Скачан: {filename} ({len(resp.content)} байт)")
+                upload_total_size += len(content)
+                logger.info(f"[API] Скачан: {filename} ({len(content)} байт)")
     except Exception as e:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=str(e)[:200])
+        raise HTTPException(status_code=500, detail="Ошибка скачивания файлов")
 
     if not saved_paths:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail="Не удалось скачать файлы")
+        raise HTTPException(status_code=400, detail="Не удалось скачать ни одного файла (проверьте URL; внутренние адреса запрещены)")
 
-    # Номер закупки от клиента (Saby/Битрикс знают точно) — если задан, модель
-    # для извлечения номера НЕ вызывается, кэш проверяется сразу по нему.
-    prefetched_number = (req.purchase_number or "").strip() or None
+    # callback_url — сервер будет POST-ить на него результат. Защита от SSRF:
+    # запрещаем внутренние адреса (иначе атакующий бьёт по соседним контейнерам/127.0.0.1).
+    if req.callback_url:
+        ok, reason = is_safe_outbound_url(req.callback_url)
+        if not ok:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=f"callback_url отклонён: {reason}")
+
+    # Номер закупки от клиента (Saby/Битрикс знают точно) — валидируем (анти-XSS),
+    # если задан — модель для извлечения номера НЕ вызывается.
+    prefetched_number = sanitize_purchase_number(req.purchase_number)
 
     task_id = str(uuid.uuid4())
     tasks[task_id] = {
@@ -1482,7 +1585,9 @@ async def auth_login(req: LoginRequest, request: Request):
     sessions[session_token] = user["id"]
 
     response = JSONResponse({"ok": True})
-    response.set_cookie("session", session_token, httponly=True, max_age=86400 * 7)
+    # Secure — сайт только по HTTPS (nginx редиректит 80→443); SameSite=Lax — анти-CSRF
+    response.set_cookie("session", session_token, httponly=True, secure=True,
+                        samesite="lax", max_age=86400 * 7)
     return response
 
 
@@ -1671,6 +1776,8 @@ async def refine(req: RefineRequest, request: Request):
 
     task = tasks.get(req.task_id)
     if not task:
+        raise HTTPException(status_code=404, detail="Задача не найдена или устарела (TTL 30 мин)")
+    if not _check_task_owner(task, request):
         raise HTTPException(status_code=404, detail="Задача не найдена или устарела (TTL 30 мин)")
 
     context = task.get("context")

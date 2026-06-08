@@ -30,6 +30,11 @@ SKIP_EXTENSIONS = {".pptx", ".xlsb", ".jpg", ".jpeg", ".png", ".gif", ".bmp"}
 
 MAX_ARCHIVE_DEPTH = 3
 
+# Анти-DoS лимиты на распаковку (см. security-аудит)
+ARCHIVE_MAX_TOTAL_BYTES = 500 * 1024 * 1024  # суммарный распакованный размер
+ARCHIVE_MAX_FILES = 5000                       # число файлов
+ARCHIVE_MAX_RATIO = 120                         # макс. коэффициент сжатия (zip-бомба)
+
 
 @dataclass
 class ExtractedFile:
@@ -58,17 +63,33 @@ def _fix_zip_filename(name: str) -> str:
 
 
 def _unpack_zip_inner(arch_path: Path, target_dir: Path):
-    """Чистая распаковка ZIP (без рекурсии). С фиксом кириллических имён."""
+    """Чистая распаковка ZIP (без рекурсии). С фиксом кириллических имён,
+    защитой от zip-slip (path traversal) и анти-zip-бомба лимитами."""
+    base = target_dir.resolve()
+    total = 0
+    count = 0
     with zipfile.ZipFile(arch_path, "r") as zf:
         for info in zf.infolist():
+            # анти zip-бомба: оценка по метаданным без чтения данных
+            if info.compress_size and info.file_size / max(info.compress_size, 1) > ARCHIVE_MAX_RATIO:
+                logger.warning(f"[ZIP] подозрение на zip-бомбу (ratio), пропуск: {info.filename}")
+                continue
+            count += 1
+            total += info.file_size
+            if count > ARCHIVE_MAX_FILES or total > ARCHIVE_MAX_TOTAL_BYTES:
+                logger.warning(f"[ZIP] превышен лимит распаковки ({arch_path.name}) — остановка")
+                break
             fixed_name = _fix_zip_filename(info.filename)
-            data = zf.read(info.filename)
-            dest = target_dir / fixed_name
+            dest = (base / fixed_name).resolve()
+            # анти zip-slip: dest обязан оставаться внутри base
+            if dest != base and base not in dest.parents:
+                logger.warning(f"[ZIP] path traversal заблокирован: {info.filename}")
+                continue
             if info.is_dir():
                 dest.mkdir(parents=True, exist_ok=True)
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(data)
+                dest.write_bytes(zf.read(info.filename))
 
 
 def _unpack_7z_inner(arch_path: Path, target_dir: Path):
