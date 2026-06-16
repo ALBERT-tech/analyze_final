@@ -25,6 +25,7 @@ import sqlite3
 import json
 import logging
 import time
+import secrets
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def _get_db() -> sqlite3.Connection:
 
 
 def init_db():
-    """Создаёт таблицу tender_cache при первом запуске."""
+    """Создаёт таблицу tender_cache при первом запуске + миграции."""
     conn = _get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS tender_cache (
@@ -59,10 +60,29 @@ def init_db():
             user_login        TEXT,
             user_login_last   TEXT,
             hit_count         INTEGER DEFAULT 0,
-            last_accessed     REAL
+            last_accessed     REAL,
+            share_token       TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cache_expires ON tender_cache(expires_at);
     """)
+
+    # Миграция: share_token для публичной ссылки на отчёт (/r/{token})
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tender_cache)").fetchall()]
+    if "share_token" not in cols:
+        conn.execute("ALTER TABLE tender_cache ADD COLUMN share_token TEXT")
+        logger.info("[CACHE] Миграция: добавлен столбец share_token")
+
+    # Backfill: каждой старой строке без токена — свой случайный токен
+    missing = conn.execute(
+        "SELECT purchase_number FROM tender_cache WHERE share_token IS NULL OR share_token = ''"
+    ).fetchall()
+    for r in missing:
+        conn.execute("UPDATE tender_cache SET share_token = ? WHERE purchase_number = ?",
+                     (secrets.token_urlsafe(12), r[0]))
+    if missing:
+        logger.info(f"[CACHE] Backfill share_token: {len(missing)} записей")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_token ON tender_cache(share_token)")
     conn.commit()
     conn.close()
 
@@ -100,17 +120,19 @@ def save_cache(
     extracted_text: str,
     text_report: str,
     user_login: str = "",
-) -> None:
-    """Сохраняет или перезаписывает запись (UPSERT). hit_count сохраняется."""
+) -> str:
+    """Сохраняет или перезаписывает запись (UPSERT). hit_count и share_token
+    сохраняются при перезаписи. Возвращает share_token (для публичной ссылки)."""
     now = time.time()
     expires = now + CACHE_TTL_SECONDS
+    new_token = secrets.token_urlsafe(12)  # используется только если строка новая
     conn = _get_db()
     conn.execute("""
         INSERT INTO tender_cache (
             purchase_number, mode, created_at, expires_at, total_size_bytes,
             result_json, files_meta_json, extracted_text, text_report,
-            user_login, user_login_last, hit_count, last_accessed
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            user_login, user_login_last, hit_count, last_accessed, share_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         ON CONFLICT(purchase_number) DO UPDATE SET
             mode = excluded.mode,
             created_at = excluded.created_at,
@@ -125,11 +147,36 @@ def save_cache(
     """, (
         purchase_number, mode, now, expires, total_size_bytes,
         json.dumps(result, ensure_ascii=False), json.dumps(files_meta, ensure_ascii=False),
-        extracted_text, text_report, user_login, user_login, now,
+        extracted_text, text_report, user_login, user_login, now, new_token,
     ))
+    # На случай старой строки без токена — проставим (UPSERT его не трогает)
+    conn.execute(
+        "UPDATE tender_cache SET share_token = ? WHERE purchase_number = ? "
+        "AND (share_token IS NULL OR share_token = '')",
+        (new_token, purchase_number),
+    )
+    row = conn.execute(
+        "SELECT share_token FROM tender_cache WHERE purchase_number = ?", (purchase_number,)
+    ).fetchone()
     conn.commit()
     conn.close()
+    token = row["share_token"] if row else new_token
     logger.info(f"[CACHE] Сохранено: №{purchase_number}, mode={mode}, TTL {CACHE_TTL_DAYS} дней")
+    return token
+
+
+def get_by_token(token: str) -> dict | None:
+    """Возвращает запись по share_token (для публичного /r/{token}) или None
+    если токен не найден / запись истекла."""
+    if not token:
+        return None
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM tender_cache WHERE share_token = ? AND expires_at > ?",
+        (token, time.time()),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def increment_hit(purchase_number: str, user_login: str = "") -> None:

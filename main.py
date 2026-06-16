@@ -22,6 +22,7 @@ import uuid
 import socket
 import ipaddress
 import os.path
+from html import escape
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -69,6 +70,9 @@ RETRY_STATUSES = (0, 404, 429, 500, 502, 503, 504)
 
 # Лимиты на скачивание/распаковку (anti-DoS, см. security-аудит)
 MAX_DOWNLOAD_BYTES = int(os.getenv("MAX_DOWNLOAD_BYTES", str(60 * 1024 * 1024)))   # 60 МБ на файл
+
+# Базовый публичный URL для ссылок на отчёт (/r/{token})
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://robotender.ru").rstrip("/")
 PURCHASE_NUMBER_RE = re.compile(r"^[A-Za-zА-Яа-яЁё0-9._\-/]{1,40}$")
 
 
@@ -174,6 +178,11 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Публичные пути
         if path in PUBLIC_PATHS or path.startswith("/static/"):
+            return await call_next(request)
+
+        # Публичная ссылка на отчёт по неугадываемому токену (/r/{token}) — без авторизации.
+        # Доступ ограничен валидным share_token внутри обработчика.
+        if path.startswith("/r/"):
             return await call_next(request)
 
         # Страница логина
@@ -549,6 +558,7 @@ def _restore_task_from_cache(task: dict, cached: dict, user_login: str = "") -> 
         completed_at=cached.get("created_at"),  # дата = когда сделан оригинал
         from_cache=True,
         awaiting_decision=False,
+        share_token=cached.get("share_token"),
     )
     cache_module.increment_hit(cached["purchase_number"], user_login)
 
@@ -573,6 +583,8 @@ async def _send_done_callback(task_id: str) -> None:
                 "meta": task.get("meta"),
                 "purchase_number": task.get("purchase_number"),
                 "from_cache": task.get("from_cache", False),
+                "share_url": (f"{PUBLIC_BASE_URL}/r/{task['share_token']}"
+                              if task.get("share_token") else None),
             })
         logger.info(f"[TASK {task_id[:8]}] Callback отправлен (from_cache={task.get('from_cache')})")
     except Exception as e:
@@ -942,7 +954,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                 u = auth_module.get_user_by_id(uid)
                 if u:
                     user_login = u["login"]
-            cache_module.save_cache(
+            share_token = cache_module.save_cache(
                 purchase_number=cache_key, mode="full",
                 total_size_bytes=meta["total_size_bytes"],
                 result={"results": flat_results, "risks": risks_result,
@@ -950,6 +962,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                 files_meta=files_meta, extracted_text=context,
                 text_report=text_report, user_login=user_login,
             )
+            task["share_token"] = share_token
         except Exception as ce:
             logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
 
@@ -978,6 +991,8 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                         "text": text_report,
                         "meta": meta,
                         "purchase_number": purchase_number,
+                        "share_url": (f"{PUBLIC_BASE_URL}/r/{task['share_token']}"
+                                      if task.get("share_token") else None),
                     })
                 logger.info(f"[TASK {task_id[:8]}] Callback отправлен")
             except Exception as cb_err:
@@ -1079,13 +1094,14 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
                 u = auth_module.get_user_by_id(uid)
                 if u:
                     user_login = u["login"]
-            cache_module.save_cache(
+            share_token = cache_module.save_cache(
                 purchase_number=cache_key, mode="short",
                 total_size_bytes=meta["total_size_bytes"],
                 result={"results": parsed, "risks": [], "parameters": parsed, "warnings": []},
                 files_meta=files_meta, extracted_text=context,
                 text_report=text_report, user_login=user_login,
             )
+            task["share_token"] = share_token
         except Exception as ce:
             logger.error(f"[TASK {task_id[:8]}] [CACHE] Ошибка записи: {ce}")
 
@@ -1107,6 +1123,8 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
                         "status": "done",
                         "results": parsed, "text": text_report, "meta": meta,
                         "purchase_number": purchase_number,
+                        "share_url": (f"{PUBLIC_BASE_URL}/r/{task['share_token']}"
+                                      if task.get("share_token") else None),
                     })
                 logger.info(f"[TASK {task_id[:8]}] Callback отправлен")
             except Exception as cb_err:
@@ -1336,6 +1354,8 @@ async def get_status(task_id: str, request: Request):
             "purchase_number": task.get("purchase_number"),
             "completed_at": completed_at_ts,
             "from_cache": task.get("from_cache", False),
+            "share_url": (f"{PUBLIC_BASE_URL}/r/{task['share_token']}"
+                          if task.get("share_token") else None),
         })
     elif task["status"] == "cached_exists":
         return JSONResponse({
@@ -1806,6 +1826,45 @@ async def refine(req: RefineRequest, request: Request):
                              purchase_number=task.get("purchase_number"))
 
     return JSONResponse({"item": parsed[0]})
+
+
+# -- Публичная ссылка на отчёт (без авторизации, по неугадываемому токену) --
+
+@app.get("/r/{token}", response_class=HTMLResponse)
+async def public_report(token: str):
+    """Публичная read-only страница отчёта по share_token из кэша.
+    Токен неугадываем (token_urlsafe) → ссылка не перечислима. Контент —
+    анализ ПУБЛИЧНОЙ тендерной документации, отдельная авторизация не нужна."""
+    cached = cache_module.get_by_token(token)
+    if not cached:
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>Отчёт не найден</title>"
+            "<body style='max-width:700px;margin:48px auto;font:15px/1.5 system-ui;color:#444'>"
+            "<h2>Отчёт не найден</h2><p>Ссылка недействительна или срок хранения отчёта истёк "
+            "(отчёты хранятся 30 дней).</p>",
+            status_code=404,
+        )
+    num = cached.get("purchase_number", "")
+    title = f"Отчёт по закупке № {escape(str(num))}" if not str(num).startswith("no-") else "Отчёт по закупке"
+    report = escape(cached.get("text_report", "") or "")
+    html = (
+        "<!doctype html><meta charset=utf-8>"
+        f"<title>{title}</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<body style='max-width:900px;margin:24px auto;padding:0 16px;"
+        "font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1a1a1a'>"
+        f"<h2 style='color:#208C8D'>{title}</h2>"
+        "<pre style='white-space:pre-wrap;word-wrap:break-word;font:inherit'>"
+        f"{report}</pre>"
+        "<hr style='margin-top:32px;border:none;border-top:1px solid #e0e0e0'>"
+        "<p style='color:#888;font-size:13px'>Анализ тендерной документации · robotender.ru</p>"
+    )
+    # Засчитываем просмотр (как обращение к кэшу)
+    try:
+        cache_module.increment_hit(cached["purchase_number"], "public-link")
+    except Exception:
+        pass
+    return HTMLResponse(html)
 
 
 # Статика ПОСЛЕ роутов
