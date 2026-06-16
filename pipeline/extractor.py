@@ -41,7 +41,8 @@ MAX_ARCHIVE_DEPTH = 3
 # -- Vision-OCR (сканы и картинки через мультимодальную модель АгентПлатформ) --
 OCR_ENABLED      = os.getenv("OCR_ENABLED", "1") == "1"
 OCR_MODEL        = os.getenv("OCR_MODEL", "google/gemini-2.5-flash")
-OCR_MAX_PAGES    = int(os.getenv("OCR_MAX_PAGES", "30"))
+OCR_MAX_PAGES    = int(os.getenv("OCR_MAX_PAGES", "30"))         # кап страниц на ОДИН документ
+OCR_MAX_PAGES_TOTAL = int(os.getenv("OCR_MAX_PAGES_TOTAL", "100"))  # кап страниц на ВСЮ задачу (все файлы)
 OCR_MAX_SIDE_PX  = int(os.getenv("OCR_MAX_SIDE_PX", "2000"))
 OCR_API_KEY      = os.getenv("API_KEY", "")
 OCR_API_URL      = os.getenv("API_URL", "https://api.agentplatform.ru/v1/chat/completions")
@@ -311,16 +312,17 @@ FORMAT_HANDLERS = {
 
 # -- Vision-OCR -----------------------------------------------------------
 
-def _render_to_jpegs(file_path: Path, is_pdf: bool) -> tuple[list[bytes], bool]:
-    """Рендерит документ в JPEG-страницы через PyMuPDF (fitz).
+def _render_to_jpegs(file_path: Path, is_pdf: bool, max_pages: int) -> tuple[list[bytes], bool]:
+    """Рендерит документ в JPEG-страницы через PyMuPDF (fitz), не более max_pages.
     PDF → каждая страница (апскейл до OCR_MAX_SIDE_PX для читаемости);
-    картинка → 1 кадр (только даунскейл крупных). Возвращает (jpegs, обрезано_ли)."""
+    картинка → 1 кадр (только даунскейл крупных). Возвращает (jpegs, обрезано_ли).
+    page_count читается из метаданных (быстро) — страницы сверх лимита НЕ рендерятся."""
     import fitz  # PyMuPDF — уже в зависимостях (через pymupdf4llm)
     jpegs: list[bytes] = []
     doc = fitz.open(str(file_path))
     try:
         total = doc.page_count if is_pdf else 1
-        n = min(total, OCR_MAX_PAGES)
+        n = min(total, max_pages)
         for i in range(n):
             page = doc[i]
             long_side = max(page.rect.width, page.rect.height) or 1.0
@@ -331,7 +333,7 @@ def _render_to_jpegs(file_path: Path, is_pdf: bool) -> tuple[list[bytes], bool]:
             scale = max(0.1, min(scale, 4.0))
             pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
             jpegs.append(pix.tobytes("jpeg"))
-        truncated = total > OCR_MAX_PAGES
+        truncated = total > n
     finally:
         doc.close()
     return jpegs, truncated
@@ -368,15 +370,16 @@ def _vision_ocr_image(img_bytes: bytes) -> str:
     return ""
 
 
-def _ocr_document(file_path: Path, is_pdf: bool) -> str:
-    """Прогоняет документ (скан-PDF или картинку) через Vision-OCR. Склеивает страницы."""
+def _ocr_document(file_path: Path, is_pdf: bool, max_pages: int) -> tuple[str, int]:
+    """Прогоняет документ (скан-PDF или картинку) через Vision-OCR, не более max_pages.
+    Возвращает (текст, сколько_страниц_реально_обработано) — для учёта бюджета задачи."""
     try:
-        jpegs, truncated = _render_to_jpegs(file_path, is_pdf)
+        jpegs, truncated = _render_to_jpegs(file_path, is_pdf, max_pages)
     except Exception as e:
         logger.warning(f"[OCR] рендер не удался {file_path.name}: {e}")
-        return ""
+        return "", 0
     if not jpegs:
-        return ""
+        return "", 0
     logger.info(f"[OCR] {file_path.name}: {len(jpegs)} стр. → vision ({OCR_MODEL})")
     parts: list[str] = []
     multi = len(jpegs) > 1
@@ -385,8 +388,9 @@ def _ocr_document(file_path: Path, is_pdf: bool) -> str:
         if t:
             parts.append((f"\n--- страница {idx} ---\n" if multi else "") + t)
     if truncated:
-        parts.append(f"\n[OCR обрезан: обработано первых {OCR_MAX_PAGES} страниц из документа]")
-    return "\n".join(parts).strip()
+        parts.append(f"\n[OCR обрезан: обработано первых {len(jpegs)} страниц документа — "
+                     f"остальное не прочитано из-за лимита]")
+    return "\n".join(parts).strip(), len(jpegs)
 
 
 # -- Главная функция ------------------------------------------------------
@@ -414,6 +418,9 @@ def extract_files(uploaded_paths: list[Path]) -> list[ExtractedFile]:
             all_files.append(path)
 
     logger.info(f"[ИНВЕНТАРИЗАЦИЯ] Всего файлов: {len(all_files)}")
+
+    # Бюджет страниц Vision-OCR на ВСЮ задачу (защита от огромных/множественных сканов)
+    ocr_pages_left = OCR_MAX_PAGES_TOTAL
 
     # --- Шаг 2: извлечение текста ---
     for file_path in all_files:
@@ -458,11 +465,17 @@ def extract_files(uploaded_paths: list[Path]) -> list[ExtractedFile]:
             if OCR_ENABLED:
                 need_ocr = is_image or (ext == ".pdf" and len(text.strip()) < PDF_SCAN_MIN_CHARS)
                 if need_ocr:
-                    ocr_text = _ocr_document(file_path, is_pdf=(ext == ".pdf"))
-                    if ocr_text.strip():
-                        text = ocr_text
-                        ocr_used = True
-                        logger.info(f"[OCR] {name}: получено {len(ocr_text)} симв. через vision")
+                    allow = min(OCR_MAX_PAGES, ocr_pages_left)
+                    if allow <= 0:
+                        logger.warning(f"[OCR] {name}: бюджет страниц задачи ({OCR_MAX_PAGES_TOTAL}) исчерпан — пропуск OCR")
+                    else:
+                        ocr_text, pages_done = _ocr_document(file_path, is_pdf=(ext == ".pdf"), max_pages=allow)
+                        ocr_pages_left -= pages_done
+                        if ocr_text.strip():
+                            text = ocr_text
+                            ocr_used = True
+                            logger.info(f"[OCR] {name}: получено {len(ocr_text)} симв. через vision "
+                                        f"({pages_done} стр., бюджет осталось {ocr_pages_left})")
 
             if not text.strip():
                 # картинка/скан, который не дался даже OCR — помечаем пропущенным
