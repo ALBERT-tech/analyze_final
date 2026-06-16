@@ -654,9 +654,10 @@ function renderFilesTable(meta) {
           const icon = st === 'ok' ? '✓' : st === 'warn_short' ? '⚠' : '✗';
           const cls = st === 'ok' ? 'ok' : st === 'warn_short' ? 'warn' : 'skipped';
           const title = (f.skip_reason && st !== 'ok') ? `title="${esc(f.skip_reason)}"` : '';
+          const ocrTag = f.ocr ? ' <span style="font-size:10px;color:#208C8D;border:1px solid #208C8D;border-radius:8px;padding:0 5px;white-space:nowrap">СКАН→OCR</span>' : '';
           return `<tr ${title}>
             <td><span class="f-status ${cls}">${icon}</span></td>
-            <td class="name">${esc(f.name)}</td>
+            <td class="name">${esc(f.name)}${ocrTag}</td>
             <td>${esc(f.type || '—')}</td>
             <td class="num">${fmtBytes(f.size_bytes)}</td>
             <td class="num">${fmtNum(f.chars)}</td>

@@ -365,6 +365,7 @@ def build_files_meta(docs: list[dict], extracted: list) -> list[dict]:
             "size_bytes": d.get("size_bytes", 0),
             "chars": chars,
             "tokens": chars // 4,
+            "ocr": d.get("ocr", False),
             "status": "ok" if chars >= 50 else "warn_short",
             "skip_reason": "" if chars >= 50 else "текст короткий (возможно скан без OCR)",
         })
@@ -729,7 +730,8 @@ def format_report(risks: list, params: list, warnings: list, meta: dict) -> str:
         lines.append("Обработанные файлы:")
         for f in ok_files:
             tokens = f.get("tokens") or (f.get("chars", 0) // 4)
-            lines.append(f'  + {f["name"]} ({f["type"]}, {f["chars"]} симв., ~{tokens} токенов)')
+            ocr_tag = "СКАН→OCR, " if f.get("ocr") else ""
+            lines.append(f'  + {f["name"]} ({f["type"]}, {ocr_tag}{f["chars"]} симв., ~{tokens} токенов)')
         lines.append("")
 
     # Пропущенные файлы — берём из meta.files со status=skipped (предпочтительно),
@@ -858,6 +860,7 @@ async def process_task_v3(task_id: str, saved_paths: list[Path], tmp_dir: Path):
                 "sections": sections,
                 "char_count": len(f.text),
                 "size_bytes": getattr(f, "size_bytes", 0),
+                "ocr": getattr(f, "ocr", False),
             })
             logger.info(f"[TASK {task_id[:8]}] {f.name}: тип={doc_type}, {len(f.text)} симв.")
 
@@ -1048,7 +1051,8 @@ async def process_task_short(task_id: str, saved_paths: list[Path], tmp_dir: Pat
             sections = split_into_sections(f.text)
             docs.append({"name": f.name, "type": doc_type,
                          "sections": sections, "char_count": len(f.text),
-                         "size_bytes": getattr(f, "size_bytes", 0)})
+                         "size_bytes": getattr(f, "size_bytes", 0),
+                         "ocr": getattr(f, "ocr", False)})
             logger.info(f"[TASK {task_id[:8]}] {f.name}: {doc_type}, {len(f.text)} симв.")
 
         task.update(step="context", detail="Сборка контекста...")
