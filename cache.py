@@ -2,7 +2,7 @@
 cache.py — Кэш анализов тендеров по номеру закупки.
 
 Хранится в общей БД (data/app.db, рядом с users).
-TTL по умолчанию 30 дней. Просроченные записи удаляются автоматически
+TTL по умолчанию 90 дней. Просроченные записи удаляются автоматически
 при каждом get_cache() / get_all_cached().
 
 Структура tender_cache:
@@ -31,7 +31,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path("data/app.db")
-CACHE_TTL_DAYS = 30
+CACHE_TTL_DAYS = 90
 CACHE_TTL_SECONDS = CACHE_TTL_DAYS * 86400
 
 

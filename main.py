@@ -1841,7 +1841,7 @@ async def public_report(token: str):
             "<!doctype html><meta charset=utf-8><title>Отчёт не найден</title>"
             "<body style='max-width:700px;margin:48px auto;font:15px/1.5 system-ui;color:#444'>"
             "<h2>Отчёт не найден</h2><p>Ссылка недействительна или срок хранения отчёта истёк "
-            "(отчёты хранятся 30 дней).</p>",
+            f"(отчёты хранятся {cache_module.CACHE_TTL_DAYS} дней).</p>",
             status_code=404,
         )
     num = cached.get("purchase_number", "")
