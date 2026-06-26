@@ -1843,6 +1843,7 @@ async def public_report(token: str):
     if not cached:
         return HTMLResponse(
             "<!doctype html><meta charset=utf-8><title>Отчёт не найден</title>"
+            "<link rel=icon type=image/svg+xml href=/static/favicon.svg>"
             "<body style='max-width:700px;margin:48px auto;font:15px/1.5 system-ui;color:#444'>"
             "<h2>Отчёт не найден</h2><p>Ссылка недействительна или срок хранения отчёта истёк "
             f"(отчёты хранятся {cache_module.CACHE_TTL_DAYS} дней).</p>",
@@ -1854,6 +1855,7 @@ async def public_report(token: str):
     html = (
         "<!doctype html><meta charset=utf-8>"
         f"<title>{title}</title>"
+        "<link rel=icon type=image/svg+xml href=/static/favicon.svg>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
         "<body style='max-width:900px;margin:24px auto;padding:0 16px;"
         "font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:#1a1a1a'>"
@@ -1869,6 +1871,12 @@ async def public_report(token: str):
     except Exception:
         pass
     return HTMLResponse(html)
+
+
+# /favicon.ico → отдаём SVG-иконку (бренд-робот в очках). Путь уже в PUBLIC_PATHS.
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return RedirectResponse("/static/favicon.svg")
 
 
 # Статика ПОСЛЕ роутов
